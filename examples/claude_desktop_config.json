@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hyperliquid-quant": {
+      "command": "hl-quant-mcp",
+      "env": {
+        "HL_NETWORK": "testnet",
+        "HL_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

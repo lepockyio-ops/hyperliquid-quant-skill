@@ -1,0 +1,9 @@
+# Append this entry to ~/.openclaw/config.yaml
+
+skills:
+  - name: hyperliquid-quant
+    command: hl-quant-mcp
+    # Optional: pass env vars if you don't want to use a .env file in CWD
+    env:
+      HL_NETWORK: testnet
+      HL_LOG_LEVEL: INFO
