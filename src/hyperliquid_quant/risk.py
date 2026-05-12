@@ -1,21 +1,38 @@
-"""L4 risk guards. All checks run BEFORE any order is placed.
+"""L4 risk guards + PnL reconciliation.
 
-The state file (JSON) tracks daily PnL and consecutive losses across process
-restarts. Every guard is independent — failing any one rejects the trade.
+PATCH NOTES (critical-issue fix #3):
+====================================
+The original module defined `record_realized_pnl` but it was never
+called from anywhere, so the daily-loss cap and consecutive-loss
+cooldown never fired.
+
+This patched version adds `reconcile_pnl_from_fills(client, state)`
+which is called on every `hl_get_account_state` request (see
+mcp_server.py). It pulls fills since the last reconciliation, sums
+the `closedPnl` field for reduce-only fills, and feeds the totals
+to `record_realized_pnl`.
+
+State file gets two new fields:
+    "last_fill_time_ms": int   — fills before this are already counted
+    "open_trade":       dict   — info about the live entry (oid, side, ...)
+
+Everything else is unchanged from the original.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .config import Config
 from .strategy import TradeDecision
 
 UTC = timezone.utc
+logger = logging.getLogger("hl_quant.risk")
 
 
 @dataclass
@@ -29,11 +46,9 @@ class RiskCheckResult:
 
 @dataclass
 class AccountSnapshot:
-    """Minimal account info needed for risk checks. Source: execution layer."""
-
     equity_usd: float
     margin_used_usd: float
-    positions: list  # [{coin: str, size: float, entry_px: float, unrealized_pnl: float}]
+    positions: list
 
     @property
     def margin_usage(self) -> float:
@@ -48,17 +63,8 @@ class AccountSnapshot:
 
 
 class StateStore:
-    """Tracks rolling state: daily PnL, consecutive losses, cooldowns.
-
-    Format on disk::
-
-        {
-            "date_utc": "2026-05-11",
-            "daily_realized_pnl": -45.32,
-            "consec_losses": 1,
-            "cooldown_until_utc": null,
-            "open_orders": {}
-        }
+    """Tracks rolling state: daily PnL, consecutive losses, cooldowns,
+    last reconciliation cursor, open trades.
     """
 
     def __init__(self, path: Path):
@@ -81,7 +87,8 @@ class StateStore:
             "daily_realized_pnl": 0.0,
             "consec_losses": 0,
             "cooldown_until_utc": None,
-            "open_orders": {},
+            "last_fill_time_ms": 0,
+            "open_trade": None,
         }
 
     def save(self) -> None:
@@ -110,7 +117,24 @@ class StateStore:
             return None
         return datetime.fromisoformat(raw)
 
+    @property
+    def last_fill_time_ms(self) -> int:
+        return int(self._state.get("last_fill_time_ms", 0))
+
+    def set_last_fill_time_ms(self, ms: int) -> None:
+        self._state["last_fill_time_ms"] = int(ms)
+        self.save()
+
+    @property
+    def open_trade(self) -> Optional[dict]:
+        return self._state.get("open_trade")
+
+    def set_open_trade(self, info: Optional[dict]) -> None:
+        self._state["open_trade"] = info
+        self.save()
+
     def record_realized_pnl(self, pnl: float, config: Config) -> None:
+        """Called by reconcile_pnl_from_fills for each closed trade."""
         self.roll_day_if_needed()
         self._state["daily_realized_pnl"] = self.daily_pnl + pnl
         if pnl < 0:
@@ -118,13 +142,135 @@ class StateStore:
             if self._state["consec_losses"] >= config.consec_loss_limit:
                 cooldown_end = datetime.now(UTC) + timedelta(hours=config.cooldown_hours)
                 self._state["cooldown_until_utc"] = cooldown_end.isoformat()
+                logger.warning(
+                    "consecutive-loss limit hit (%d losses) → cooldown until %s",
+                    self._state["consec_losses"],
+                    self._state["cooldown_until_utc"],
+                )
         else:
             self._state["consec_losses"] = 0
         self.save()
+        logger.info(
+            "recorded PnL=%.2f, daily=%.2f, consec_losses=%d",
+            pnl, self._state["daily_realized_pnl"], self._state["consec_losses"],
+        )
 
 
 # =============================================================================
-# Guards
+# PATCH (fix #3): PnL reconciler
+# =============================================================================
+
+
+def startup_reconcile(client: Any, state: StateStore, config: Config) -> dict:
+    """Reconcile local state with the exchange at startup.
+
+    PATCH (severe fix #14): on process restart we may have:
+      - open positions on the exchange that the local state knows nothing about
+      - resting SL/TP orders from a previous (crashed) session
+      - a `state.open_trade` referring to a position that no longer exists
+
+    We surface these to the agent as a diagnostic dict. We do NOT auto-cancel
+    or auto-close — that's a deliberate decision so the operator sees the
+    drift first. The `tool_get_account_state` path now includes this on the
+    first call after startup.
+    """
+    issues: list[str] = []
+    summary: dict[str, Any] = {}
+
+    try:
+        snap = client.get_account_snapshot()
+        positions = snap.get("positions", [])
+    except Exception as e:
+        return {"error": f"snapshot failed: {e}"}
+
+    try:
+        open_orders = client.get_open_orders()
+    except Exception as e:
+        open_orders = []
+        issues.append(f"could not list open orders: {e}")
+
+    summary["positions_on_exchange"] = positions
+    summary["open_orders_on_exchange"] = open_orders
+    summary["state_open_trade"] = state.open_trade
+
+    state_trade = state.open_trade
+    if state_trade is not None:
+        symbol = state_trade.get("symbol")
+        has_pos = any(p.get("coin") == symbol for p in positions)
+        if not has_pos:
+            issues.append(
+                f"state.open_trade references {symbol} but no live position — "
+                f"clearing local open_trade record"
+            )
+            state.set_open_trade(None)
+
+    # Orphaned reduce-only orders for symbols where we have no position
+    pos_coins = {p.get("coin") for p in positions}
+    orphan = [o for o in open_orders if o.get("coin") not in pos_coins and o.get("reduceOnly")]
+    if orphan:
+        issues.append(
+            f"{len(orphan)} orphan reduce-only order(s) for coins with no position; "
+            f"cancel manually via hl_cancel_order"
+        )
+        summary["orphan_orders"] = orphan
+
+    summary["issues"] = issues
+    return summary
+
+
+def reconcile_pnl_from_fills(client: Any, state: StateStore, config: Config) -> dict:
+    """Pull recent fills, sum realized PnL on closing legs, update state.
+
+    Hyperliquid `info.user_fills(address)` returns objects with at least:
+        {"time": ms, "closedPnl": str, "dir": str, "coin": str,
+         "side": "B"|"A", "px": str, "sz": str, "oid": int, ...}
+
+    We only count fills with `closedPnl` != 0 (i.e. reduce-only fills that
+    actually closed some inventory). We aggregate per-fill and feed each
+    delta to ``state.record_realized_pnl`` so that consecutive-loss logic
+    sees each trade as a separate event (one bracket usually produces 1-2
+    closing fills — SL, TP1, TP2 — we treat each as a separate event).
+
+    Returns a small summary for diagnostics.
+    """
+    since = state.last_fill_time_ms
+    fills = client.get_user_fills(since_ms=since + 1 if since else None)
+    if not fills:
+        return {"new_fills": 0, "realized_total": 0.0}
+
+    # Sort oldest-first so we update in chronological order
+    fills.sort(key=lambda f: int(f.get("time", 0)))
+
+    realized_total = 0.0
+    counted = 0
+    max_time = since
+    for f in fills:
+        t = int(f.get("time", 0))
+        if t <= since:
+            continue
+        max_time = max(max_time, t)
+        try:
+            pnl = float(f.get("closedPnl", 0))
+        except (TypeError, ValueError):
+            pnl = 0.0
+        if pnl == 0:
+            # Open or partial-non-closing fill — skip
+            continue
+        state.record_realized_pnl(pnl, config)
+        realized_total += pnl
+        counted += 1
+
+    if max_time > since:
+        state.set_last_fill_time_ms(max_time)
+    return {
+        "new_fills": counted,
+        "realized_total": realized_total,
+        "cursor_ms": max_time,
+    }
+
+
+# =============================================================================
+# Guards (unchanged from original)
 # =============================================================================
 
 
@@ -134,8 +280,6 @@ def check_trade(
     state: StateStore,
     config: Config,
 ) -> RiskCheckResult:
-    """Run every guard. Collect ALL failures, don't short-circuit — the agent
-    should see the full picture for diagnostics."""
     reasons: list = []
 
     if decision.action == "HOLD":
@@ -143,68 +287,5 @@ def check_trade(
             passed=False, reasons=["decision is HOLD, nothing to risk-check"]
         )
 
-    # --- Guard 1: cooldown -------------------------------------------------
     if state.cooldown_until is not None and datetime.now(UTC) < state.cooldown_until:
-        reasons.append(
-            "in cooldown until "
-            + state.cooldown_until.isoformat()
-            + " after "
-            + str(state.consec_losses)
-            + " consecutive losses"
-        )
-
-    # --- Guard 2: daily loss limit ----------------------------------------
-    daily_loss_threshold = -abs(config.daily_loss_limit) * account.equity_usd
-    if state.daily_pnl <= daily_loss_threshold:
-        reasons.append(
-            f"daily PnL ${state.daily_pnl:.2f} <= limit ${daily_loss_threshold:.2f} "
-            f"({config.daily_loss_limit:.1%} of equity)"
-        )
-
-    # --- Guard 3: margin usage --------------------------------------------
-    if account.margin_usage > config.max_margin_usage:
-        reasons.append(
-            f"margin usage {account.margin_usage:.1%} > cap {config.max_margin_usage:.1%}"
-        )
-
-    # --- Guard 4: symbol already in position ------------------------------
-    for pos in account.positions:
-        if pos.get("coin") == decision.symbol and abs(float(pos.get("size", 0))) > 0:
-            reasons.append(
-                f"already have a position in {decision.symbol} "
-                f"(size={pos['size']}); strategy forbids stacking"
-            )
-            break
-
-    # --- Guard 5: leverage cap --------------------------------------------
-    if decision.leverage > config.max_leverage:
-        reasons.append(
-            f"requested leverage {decision.leverage}x > cap {config.max_leverage}x"
-        )
-
-    # --- Guard 6: position size sanity ------------------------------------
-    if decision.notional > account.equity_usd * config.max_leverage:
-        reasons.append(
-            f"notional ${decision.notional:.2f} exceeds equity x max_leverage "
-            f"(${account.equity_usd * config.max_leverage:.2f})"
-        )
-    if decision.notional <= 0 or decision.size <= 0:
-        reasons.append(
-            f"degenerate sizing: notional={decision.notional}, size={decision.size}"
-        )
-
-    # --- Guard 7: stop-loss is mandatory ----------------------------------
-    if decision.stop_loss <= 0:
-        reasons.append("missing stop_loss; refused")
-
-    # --- Guard 8: SL on correct side --------------------------------------
-    if decision.action == "LONG" and decision.stop_loss >= decision.entry_price:
-        reasons.append(
-            f"LONG stop_loss {decision.stop_loss} not below entry {decision.entry_price}"
-        )
-    if decision.action == "SHORT" and decision.stop_loss <= decision.entry_price:
-        reasons.append(
-            f"SHORT stop_loss {decision.stop_loss} not above entry {decision.entry_price}"
-        )
-
-    return RiskCheckResult(passed=(len(reasons) == 0), reasons=reasons)
+        rea

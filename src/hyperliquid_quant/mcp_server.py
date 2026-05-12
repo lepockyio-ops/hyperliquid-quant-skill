@@ -1,9 +1,17 @@
-"""MCP server entrypoint — registers 8 tools over stdio.
+"""MCP server entrypoint — registers tools over stdio.
 
-Run as: ``hl-quant-mcp`` (after ``pip install -e .``).
-
-Any MCP client (OpenClaw, Claude Desktop, Cursor, Windsurf, etc.) can attach
-to this stdio process and call the tools defined below.
+PATCH NOTES (critical fixes #1-#5 + severe fixes #6, #8, #9, #11, #14):
+=======================================================================
+- hl_get_account_state auto-reconciles PnL from fills, runs startup
+  reconciliation on first call, and enforces max_hold_hours by auto-closing
+  stale positions.
+- hl_evaluate_strategy now returns a `decision_token` (single-use, TTL-bounded);
+  the LLM cannot manufacture decisions any more.
+- hl_place_order accepts ONLY a `decision_token` — the previous
+  `decision_json` path is gone. This makes "formulaic, no LLM discretion"
+  a hard property of the system, not just a prompt instruction.
+- override_risk is a hard rejection.
+- Mainnet writes are gated by HL_MAINNET_CONFIRM.
 """
 
 from __future__ import annotations
@@ -11,23 +19,30 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .config import CONFIG, Config
+from .config import CONFIG
+from .decision_cache import DecisionCache
 from .execution import HyperliquidClient
-from .risk import AccountSnapshot, StateStore, check_trade
+from .risk import (
+    AccountSnapshot,
+    StateStore,
+    check_trade,
+    reconcile_pnl_from_fills,
+    startup_reconcile,
+)
 from .signals import (
     SignalVector,
     atr,
     ema,
     funding_zscore,
-    likely_liquidation_prices,
-    nearest_cluster_distance_bps,
     reversal_candle,
+    sweep_scores,
 )
 from .strategy import evaluate
 
@@ -40,6 +55,8 @@ logger = logging.getLogger("hl_quant")
 
 _client: HyperliquidClient | None = None
 _state: StateStore | None = None
+_cache: DecisionCache | None = None
+_startup_reconciled = False
 
 
 def _get_client() -> HyperliquidClient:
@@ -56,36 +73,97 @@ def _get_state() -> StateStore:
     return _state
 
 
+def _get_cache() -> DecisionCache:
+    global _cache
+    if _cache is None:
+        _cache = DecisionCache(ttl_seconds=CONFIG.decision_ttl_seconds)
+    return _cache
+
+
+def _maybe_enforce_max_hold(client: HyperliquidClient, state: StateStore) -> dict | None:
+    """PATCH (severe fix #8): if state.open_trade exceeds max_hold_hours,
+    issue an emergency reduce-only close and clear state."""
+    open_trade = state.open_trade
+    if not open_trade:
+        return None
+    entry_ms = int(open_trade.get("entry_time_ms", 0))
+    if entry_ms <= 0:
+        return None
+    age_hours = (time.time() * 1000 - entry_ms) / 3_600_000.0
+    if age_hours < CONFIG.max_hold_hours:
+        return None
+    symbol = open_trade["symbol"]
+    logger.warning(
+        "max_hold_hours exceeded (%.2fh > %dh) for %s — auto-closing",
+        age_hours, CONFIG.max_hold_hours, symbol,
+    )
+    try:
+        result = client.close_position(symbol)
+    except Exception as e:
+        result = {"error": f"auto-close failed: {e}"}
+    state.set_open_trade(None)
+    return {
+        "auto_closed": symbol,
+        "age_hours": age_hours,
+        "limit_hours": CONFIG.max_hold_hours,
+        "exchange_response": result,
+    }
+
+
 # =============================================================================
-# Tool implementations (each returns a dict; MCP layer wraps to JSON text)
+# Tool implementations
 # =============================================================================
 
 
 def tool_get_account_state() -> dict[str, Any]:
-    """Read balance, positions, margin usage."""
-    snap = _get_client().get_account_snapshot()
+    """Read balance, positions, margin usage. PATCH: reconciles PnL,
+    enforces max_hold_hours, and runs startup reconciliation on first call."""
+    global _startup_reconciled
+    client = _get_client()
     state = _get_state()
+
+    startup_info = None
+    if not _startup_reconciled:
+        try:
+            startup_info = startup_reconcile(client, state, CONFIG)
+        except Exception as e:
+            startup_info = {"error": str(e)}
+        _startup_reconciled = True
+
+    # Reconcile PnL from fills (every call)
+    try:
+        recon = reconcile_pnl_from_fills(client, state, CONFIG)
+    except Exception as e:
+        recon = {"error": str(e)}
+
+    # Enforce max hold
+    auto_close = _maybe_enforce_max_hold(client, state)
+
+    snap = client.get_account_snapshot()
     snap["daily_pnl"] = state.daily_pnl
     snap["consec_losses"] = state.consec_losses
     snap["cooldown_until_utc"] = (
         state.cooldown_until.isoformat() if state.cooldown_until else None
     )
     snap["network"] = CONFIG.network
+    snap["mainnet_armed"] = CONFIG.mainnet_armed
+    snap["reconciliation"] = recon
+    snap["decisions_pending"] = _get_cache().peek_count()
+    if startup_info is not None:
+        snap["startup_reconciliation"] = startup_info
+    if auto_close is not None:
+        snap["max_hold_auto_close"] = auto_close
     return snap
 
 
 def tool_get_market_data(symbol: str) -> dict[str, Any]:
-    """Mid, funding, 15m candles, orderbook depth approximation."""
     symbol = symbol.upper()
     if symbol not in CONFIG.universe:
-        return {
-            "error": f"{symbol} not in HL_UNIVERSE={CONFIG.universe}",
-        }
+        return {"error": f"{symbol} not in HL_UNIVERSE={CONFIG.universe}"}
     client = _get_client()
     mid = client.get_all_mids().get(symbol)
     candles_15m = client.get_candles(symbol, "15m", lookback_bars=100)
     funding = client.get_funding_history(symbol, lookback_hours=120)
-    oi_buckets = client.get_open_interest_buckets(symbol)
     return {
         "symbol": symbol,
         "mid": mid,
@@ -103,12 +181,10 @@ def tool_get_market_data(symbol: str) -> dict[str, Any]:
         ),
         "funding_history_len": len(funding),
         "latest_funding": funding[-1] if funding else None,
-        "open_interest_buckets": oi_buckets,
     }
 
 
 def tool_compute_signals(symbol: str) -> dict[str, Any]:
-    """Run the deterministic signal vector for a symbol."""
     symbol = symbol.upper()
     if symbol not in CONFIG.universe:
         return {"error": f"{symbol} not in HL_UNIVERSE={CONFIG.universe}"}
@@ -120,18 +196,17 @@ def tool_compute_signals(symbol: str) -> dict[str, Any]:
 
     funding = client.get_funding_history(symbol, lookback_hours=120)
     fz = funding_zscore(funding, window=90)
-
     mid = client.get_all_mids().get(symbol, candles_15m[-1].close)
-
-    oi_buckets = client.get_open_interest_buckets(symbol)
-    long_clusters = likely_liquidation_prices(oi_buckets, mid, "long")
-    short_clusters = likely_liquidation_prices(oi_buckets, mid, "short")
-    near_long_bps = nearest_cluster_distance_bps(long_clusters, mid)
-    near_short_bps = nearest_cluster_distance_bps(short_clusters, mid)
 
     closes = [c.close for c in candles_15m]
     highs = [c.high for c in candles_15m]
     lows = [c.low for c in candles_15m]
+    opens = [c.open for c in candles_15m]
+
+    long_score, short_score = sweep_scores(
+        highs, lows, opens, closes, sweep_lookback=CONFIG.sweep_lookback
+    )
+
     ema_fast_v = ema(closes, 9)
     ema_slow_v = ema(closes, 21)
     atr_v = atr(highs, lows, closes, period=14)
@@ -144,8 +219,8 @@ def tool_compute_signals(symbol: str) -> dict[str, Any]:
         symbol=symbol,
         current_price=mid,
         funding_zscore=fz,
-        nearest_long_liq_bps=near_long_bps,
-        nearest_short_liq_bps=near_short_bps,
+        sweep_long_score=long_score,
+        sweep_short_score=short_score,
         ema_fast=ema_fast_v,
         ema_slow=ema_slow_v,
         ema_ratio=ratio,
@@ -157,18 +232,19 @@ def tool_compute_signals(symbol: str) -> dict[str, Any]:
 
 
 def tool_evaluate_strategy(symbol: str) -> dict[str, Any]:
-    """Compute signals + apply the formula in one call."""
+    """PATCH (severe fix #6): now issues a single-use decision_token."""
     sig = tool_compute_signals(symbol)
     if "error" in sig:
         return sig
-    snap = _get_client().get_account_snapshot()
+    client = _get_client()
+    snap = client.get_account_snapshot()
     equity = float(snap["equity_usd"])
     sv = SignalVector(
         symbol=sig["symbol"],
         current_price=sig["current_price"],
         funding_zscore=sig["funding_zscore"],
-        nearest_long_liq_bps=sig["nearest_long_liq_bps"],
-        nearest_short_liq_bps=sig["nearest_short_liq_bps"],
+        sweep_long_score=sig["sweep_long_score"],
+        sweep_short_score=sig["sweep_short_score"],
         ema_fast=sig["ema_fast"],
         ema_slow=sig["ema_slow"],
         ema_ratio=sig["ema_ratio"],
@@ -177,36 +253,47 @@ def tool_evaluate_strategy(symbol: str) -> dict[str, Any]:
         last_candle_bearish=sig["last_candle_bearish"],
     )
     decision = evaluate(sv, equity_usd=equity, config=CONFIG)
+    token = None
+    if decision.action in ("LONG", "SHORT"):
+        token = _get_cache().issue(decision)
     return {
         "signals": sig,
         "decision": decision.to_dict(),
+        "decision_token": token,
+        "ttl_seconds": CONFIG.decision_ttl_seconds,
         "equity_usd": equity,
     }
 
 
-def tool_risk_check(decision_json: str) -> dict[str, Any]:
-    """Run all L4 guards against a candidate decision (passed as JSON)."""
-    try:
-        d = json.loads(decision_json)
-    except json.JSONDecodeError as e:
-        return {"pass": False, "reasons": [f"invalid decision JSON: {e}"]}
-
-    from .strategy import TradeDecision
-
-    decision = TradeDecision(
-        action=d.get("action", "HOLD"),
-        symbol=d.get("symbol", ""),
-        reason=d.get("reason", ""),
-        entry_price=float(d.get("entry_price", 0)),
-        size=float(d.get("size", 0)),
-        notional=float(d.get("notional", 0)),
-        stop_loss=float(d.get("stop_loss", 0)),
-        take_profit_1=float(d.get("take_profit_1", 0)),
-        take_profit_2=float(d.get("take_profit_2", 0)),
-        leverage=int(d.get("leverage", 1)),
-        risk_amount=float(d.get("risk_amount", 0)),
-        sl_distance=float(d.get("sl_distance", 0)),
-    )
+def tool_risk_check(decision_token: str | None = None, decision_json: str | None = None) -> dict[str, Any]:
+    """PATCH (severe fix #6): risk-check is keyed off the cached decision,
+    not free-form JSON. For backward compatibility we accept either, but the
+    token path is the only one place_order will subsequently honour."""
+    decision = None
+    if decision_token:
+        decision = _get_cache().peek(decision_token)
+    if decision is None and decision_json:
+        try:
+            d = json.loads(decision_json)
+        except json.JSONDecodeError as e:
+            return {"pass": False, "reasons": [f"invalid decision JSON: {e}"]}
+        from .strategy import TradeDecision
+        decision = TradeDecision(
+            action=d.get("action", "HOLD"),
+            symbol=d.get("symbol", ""),
+            reason=d.get("reason", ""),
+            entry_price=float(d.get("entry_price", 0)),
+            size=float(d.get("size", 0)),
+            notional=float(d.get("notional", 0)),
+            stop_loss=float(d.get("stop_loss", 0)),
+            take_profit_1=float(d.get("take_profit_1", 0)),
+            take_profit_2=float(d.get("take_profit_2", 0)),
+            leverage=int(d.get("leverage", 1)),
+            risk_amount=float(d.get("risk_amount", 0)),
+            sl_distance=float(d.get("sl_distance", 0)),
+        )
+    if decision is None:
+        return {"pass": False, "reasons": ["no decision_token or decision_json provided"]}
 
     snap = _get_client().get_account_snapshot()
     account = AccountSnapshot(
@@ -218,37 +305,82 @@ def tool_risk_check(decision_json: str) -> dict[str, Any]:
     return result.to_dict()
 
 
-def tool_place_order(decision_json: str, override_risk: bool = False) -> dict[str, Any]:
-    """Submit the decision to Hyperliquid as a bracket order.
+def tool_place_order(decision_token: str, override_risk: bool = False) -> dict[str, Any]:
+    """PATCH (severe fix #6 + #9): decision_token only — no raw decision_json.
 
-    Refuses to execute unless risk_check passes. ``override_risk`` is accepted
-    by signature but IGNORED — present to make accidental override attempts
-    visible in logs.
+    The token must come from a previous call to hl_evaluate_strategy and
+    must not have expired (TTL=decision_ttl_seconds). The token is single-use:
+    once redeemed it cannot be replayed.
     """
     if override_risk:
-        logger.warning("override_risk=true received and IGNORED — no override allowed")
+        return {
+            "status": "rejected",
+            "reason": "override_risk is not permitted in any version of this skill",
+        }
+    if not decision_token:
+        return {"status": "rejected", "reason": "decision_token required"}
 
-    rc = tool_risk_check(decision_json)
-    if not rc.get("pass"):
-        return {"status": "rejected_by_risk", "risk_check": rc}
+    cache = _get_cache()
+    decision = cache.redeem(decision_token)
+    if decision is None:
+        return {
+            "status": "rejected_token",
+            "reason": (
+                "decision_token is unknown, already consumed, or expired. "
+                "Re-run hl_evaluate_strategy to obtain a fresh token."
+            ),
+        }
 
-    d = json.loads(decision_json)
-    if d["action"] not in ("LONG", "SHORT"):
-        return {"status": "rejected", "reason": f"action={d['action']} not actionable"}
+    # Re-run risk check on the *stored* decision (untamperable by LLM)
+    snap = _get_client().get_account_snapshot()
+    account = AccountSnapshot(
+        equity_usd=float(snap["equity_usd"]),
+        margin_used_usd=float(snap["margin_used_usd"]),
+        positions=snap["positions"],
+    )
+    rc = check_trade(decision, account, _get_state(), CONFIG)
+    if not rc.passed:
+        return {"status": "rejected_by_risk", "risk_check": rc.to_dict()}
+
+    if decision.action not in ("LONG", "SHORT"):
+        return {"status": "rejected", "reason": f"action={decision.action} not actionable"}
 
     client = _get_client()
-    is_buy = d["action"] == "LONG"
-    result = client.place_bracket_order(
-        coin=d["symbol"],
+    state = _get_state()
+    is_buy = decision.action == "LONG"
+    bracket = client.place_bracket_order(
+        coin=decision.symbol,
         is_buy=is_buy,
-        size=float(d["size"]),
-        entry_price=float(d["entry_price"]),
-        stop_loss=float(d["stop_loss"]),
-        take_profit_1=float(d["take_profit_1"]),
-        take_profit_2=float(d.get("take_profit_2") or 0) or None,
-        leverage=int(d["leverage"]),
+        size=decision.size,
+        entry_price=decision.entry_price,
+        stop_loss=decision.stop_loss,
+        take_profit_1=decision.take_profit_1,
+        take_profit_2=decision.take_profit_2 or None,
+        leverage=decision.leverage,
     )
-    return {"status": "submitted", "exchange_response": result}
+
+    result_dict = bracket.to_dict()
+
+    if bracket.entry_status == "filled":
+        state.set_open_trade({
+            "symbol": decision.symbol,
+            "side": decision.action,
+            "size": bracket.entry_fill_size,
+            "entry_px": bracket.entry_fill_avg_px,
+            "entry_time_ms": int(time.time() * 1000),  # PATCH #8: stamp for max_hold
+            "sl_oid": bracket.sl_oid,
+            "tp1_oid": bracket.tp1_oid,
+            "tp2_oid": bracket.tp2_oid,
+        })
+
+    if bracket.entry_status == "unfilled":
+        result_dict["status"] = "entry_unfilled"
+    elif not bracket.position_protected:
+        result_dict["status"] = "POSITION_UNPROTECTED_EMERGENCY_CLOSE"
+        logger.error("position unprotected; emergency-close attempted: %s", result_dict)
+    else:
+        result_dict["status"] = "submitted_and_protected"
+    return result_dict
 
 
 def tool_cancel_order(symbol: str, oid: int) -> dict[str, Any]:
@@ -256,7 +388,13 @@ def tool_cancel_order(symbol: str, oid: int) -> dict[str, Any]:
 
 
 def tool_close_position(symbol: str) -> dict[str, Any]:
-    return _get_client().close_position(symbol.upper())
+    state = _get_state()
+    result = _get_client().close_position(symbol.upper())
+    # Clear open_trade record if it matches
+    ot = state.open_trade
+    if ot and ot.get("symbol") == symbol.upper():
+        state.set_open_trade(None)
+    return result
 
 
 # =============================================================================
@@ -268,32 +406,29 @@ TOOL_DEFS: list[Tool] = [
         name="hl_get_account_state",
         description=(
             "Read Hyperliquid account state: equity, positions, margin usage, "
-            "daily PnL, cooldown status. ALWAYS call before evaluating strategy."
+            "daily PnL, cooldown status. Auto-reconciles PnL from fills, "
+            "enforces max_hold_hours by auto-closing stale positions, and "
+            "runs startup reconciliation on first call. ALWAYS call before "
+            "evaluating strategy."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
         name="hl_get_market_data",
         description=(
-            "Fetch mid price, funding history, 15m candles, and orderbook depth "
-            "buckets for one symbol. Symbol must be in HL_UNIVERSE."
+            "Fetch mid price, funding history, and 15m candles for one symbol."
         ),
         inputSchema={
             "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "Hyperliquid coin name (e.g. BTC, ETH, SOL)",
-                }
-            },
+            "properties": {"symbol": {"type": "string"}},
             "required": ["symbol"],
         },
     ),
     Tool(
         name="hl_compute_signals",
         description=(
-            "Compute the deterministic signal vector: funding Z-score, liquidation "
-            "cluster proximity (bps), EMA 9/21 ratio, ATR 14, last-candle reversal flag."
+            "Compute the deterministic signal vector: funding Z-score, "
+            "liquidity sweep scores, EMA 9/21 ratio, ATR 14, reversal flag."
         ),
         inputSchema={
             "type": "object",
@@ -304,10 +439,9 @@ TOOL_DEFS: list[Tool] = [
     Tool(
         name="hl_evaluate_strategy",
         description=(
-            "Apply the entry formula. Returns either LONG/SHORT with size, SL, TP1, "
-            "TP2, leverage, or HOLD with reasons. The numbers returned are NOT "
-            "negotiable — pass the decision unchanged to hl_risk_check then "
-            "hl_place_order."
+            "Apply the entry formula. For LONG/SHORT setups, returns a "
+            "`decision_token` (TTL seconds, single-use) that must be passed "
+            "to hl_place_order. For HOLD, returns the reasons but no token."
         ),
         inputSchema={
             "type": "object",
@@ -318,37 +452,36 @@ TOOL_DEFS: list[Tool] = [
     Tool(
         name="hl_risk_check",
         description=(
-            "Run all L4 risk guards against a candidate decision JSON. Returns "
-            "{pass: bool, reasons: [str]}. MUST pass before hl_place_order."
+            "Inspect a candidate decision against the L4 guards. Accepts "
+            "decision_token (preferred) or decision_json (read-only)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "decision_json": {
-                    "type": "string",
-                    "description": "JSON string of the TradeDecision returned by hl_evaluate_strategy",
-                }
+                "decision_token": {"type": "string"},
+                "decision_json": {"type": "string"},
             },
-            "required": ["decision_json"],
+            "required": [],
         },
     ),
     Tool(
         name="hl_place_order",
         description=(
-            "Submit a decision as a Hyperliquid bracket order (entry + SL + TP1 + TP2). "
-            "Re-runs hl_risk_check internally and refuses to execute if it fails."
+            "Submit the decision identified by decision_token as a Hyperliquid "
+            "bracket order. Token must come from a recent hl_evaluate_strategy "
+            "call and is single-use."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "decision_json": {"type": "string"},
+                "decision_token": {"type": "string"},
                 "override_risk": {
                     "type": "boolean",
-                    "description": "Has no effect; included so override attempts are visible in logs",
+                    "description": "Always rejected. Do not set.",
                     "default": False,
                 },
             },
-            "required": ["decision_json"],
+            "required": ["decision_token"],
         },
     ),
     Tool(
@@ -365,10 +498,7 @@ TOOL_DEFS: list[Tool] = [
     ),
     Tool(
         name="hl_close_position",
-        description=(
-            "Emergency reduce-only market close of any existing position in `symbol`. "
-            "Use ONLY when the user explicitly asks or in a documented black-swan."
-        ),
+        description="Emergency reduce-only market close of any existing position in symbol.",
         inputSchema={
             "type": "object",
             "properties": {"symbol": {"type": "string"}},
@@ -397,10 +527,13 @@ async def _serve() -> None:
             elif name == "hl_evaluate_strategy":
                 result = tool_evaluate_strategy(args["symbol"])
             elif name == "hl_risk_check":
-                result = tool_risk_check(args["decision_json"])
+                result = tool_risk_check(
+                    decision_token=args.get("decision_token"),
+                    decision_json=args.get("decision_json"),
+                )
             elif name == "hl_place_order":
                 result = tool_place_order(
-                    args["decision_json"], bool(args.get("override_risk", False))
+                    args["decision_token"], bool(args.get("override_risk", False))
                 )
             elif name == "hl_cancel_order":
                 result = tool_cancel_order(args["symbol"], args["oid"])
@@ -418,17 +551,13 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    """Console-script entrypoint."""
     logging.basicConfig(
         level=getattr(logging, CONFIG.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Visibility on startup — but never log the private key.
     logger.info(
-        "hl-quant-mcp starting | network=%s | universe=%s | main=%s",
-        CONFIG.network,
-        CONFIG.universe,
-        CONFIG.main_address[:8] + "..." if CONFIG.main_address else "<unset>",
+        "hl-quant-mcp starting | network=%s | mainnet_armed=%s | universe=%s",
+        CONFIG.network, CONFIG.mainnet_armed, CONFIG.universe,
     )
     asyncio.run(_serve())
 

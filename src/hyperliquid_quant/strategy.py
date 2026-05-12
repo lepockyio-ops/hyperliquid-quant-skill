@@ -1,7 +1,18 @@
 """The deterministic strategy formula.
 
 Pure function: market data + config → trade decision. No I/O, no LLM input.
-This is the heart of the bot — every entry must come through `evaluate()`.
+
+PATCH NOTES (critical-issue fix #1):
+====================================
+Replaced the broken liquidation-cluster filter:
+    OLD: signals.nearest_long_liq_bps <= config.liq_proximity_bps
+    NEW: signals.sweep_long_score    >= config.sweep_min_score
+See signals.py for the new definition. The old proxy was a fixed function
+of price and never satisfied the default threshold.
+
+Also tightened the EMA filter (the old `> 0.998` was a no-op): now requires
+ema_fast/ema_slow to confirm trend by at least `ema_trend_min` (default
+0.5%). Strategies that want pure mean-reversion can set this to 0.
 """
 
 from __future__ import annotations
@@ -57,14 +68,14 @@ def evaluate(
 ) -> TradeDecision:
     """Apply the entry formula.
 
-    Long  triggers when:  F_z < -threshold
-                          AND nearest_long_liq within liq_proximity_bps
-                          AND ema_ratio > 0.998
+    Long  triggers when:  F_z < -funding_z_threshold
+                          AND sweep_long_score >= sweep_min_score
+                          AND ema_ratio - 1 > +ema_trend_min  (uptrend)
                           AND last_candle_bullish
 
-    Short triggers when:  F_z > +threshold
-                          AND nearest_short_liq within liq_proximity_bps
-                          AND ema_ratio < 1.002
+    Short triggers when:  F_z > +funding_z_threshold
+                          AND sweep_short_score >= sweep_min_score
+                          AND ema_ratio - 1 < -ema_trend_min  (downtrend)
                           AND last_candle_bearish
 
     Otherwise HOLD.
@@ -74,24 +85,26 @@ def evaluate(
     if p <= 0:
         return TradeDecision(action="HOLD", symbol=signals.symbol, reason="invalid price")
 
+    trend = signals.ema_ratio - 1.0
+
     # ---- Long branch ----------------------------------------------------
     long_funding_ok = fz < -config.funding_z_threshold
-    long_liq_near = signals.nearest_long_liq_bps <= config.liq_proximity_bps
-    long_trend_ok = signals.ema_ratio > 0.998
+    long_sweep_ok = signals.sweep_long_score >= config.sweep_min_score
+    long_trend_ok = trend > config.ema_trend_min
     long_reversal_ok = signals.last_candle_bullish
 
-    if long_funding_ok and long_liq_near and long_trend_ok and long_reversal_ok:
+    if long_funding_ok and long_sweep_ok and long_trend_ok and long_reversal_ok:
         return _build_decision(
             side="LONG", signals=signals, equity_usd=equity_usd, config=config
         )
 
     # ---- Short branch ---------------------------------------------------
     short_funding_ok = fz > config.funding_z_threshold
-    short_liq_near = signals.nearest_short_liq_bps <= config.liq_proximity_bps
-    short_trend_ok = signals.ema_ratio < 1.002
+    short_sweep_ok = signals.sweep_short_score >= config.sweep_min_score
+    short_trend_ok = trend < -config.ema_trend_min
     short_reversal_ok = signals.last_candle_bearish
 
-    if short_funding_ok and short_liq_near and short_trend_ok and short_reversal_ok:
+    if short_funding_ok and short_sweep_ok and short_trend_ok and short_reversal_ok:
         return _build_decision(
             side="SHORT", signals=signals, equity_usd=equity_usd, config=config
         )
@@ -102,14 +115,16 @@ def evaluate(
         reasons.append(
             f"funding_z={fz:+.2f} within ±{config.funding_z_threshold}"
         )
-    if not (long_liq_near or short_liq_near):
+    if not (long_sweep_ok or short_sweep_ok):
         reasons.append(
-            f"no liq cluster within {config.liq_proximity_bps}bps "
-            f"(long={signals.nearest_long_liq_bps:.1f}bps, "
-            f"short={signals.nearest_short_liq_bps:.1f}bps)"
+            f"no sweep (long={signals.sweep_long_score:.2f}, "
+            f"short={signals.sweep_short_score:.2f}, "
+            f"need ≥{config.sweep_min_score})"
         )
     if not (long_trend_ok or short_trend_ok):
-        reasons.append(f"ema_ratio={signals.ema_ratio:.4f} ambiguous trend")
+        reasons.append(
+            f"trend={trend:+.4f} within ±{config.ema_trend_min}"
+        )
     if not (long_reversal_ok or short_reversal_ok):
         reasons.append("last candle not a reversal in any direction")
 
@@ -121,7 +136,7 @@ def evaluate(
 
 
 # =============================================================================
-# Position sizing (deterministic)
+# Position sizing (deterministic, mostly unchanged)
 # =============================================================================
 
 
@@ -141,20 +156,19 @@ def _build_decision(
             reason="ATR unavailable, cannot size position",
         )
 
-    # Stop-loss distance: max(ATR × multiplier, floor as fraction of price)
     sl_dist = max(atr_val * config.sl_atr_mult, p * config.sl_min_frac)
-
-    # Risk amount
     risk_amount = equity_usd * config.risk_per_trade
 
-    # Notional sized so that hitting SL loses risk_amount
-    raw_notional = (risk_amount / sl_dist) * p
+    # PATCH (severe fix #11): account for round-trip taker fees in sizing.
+    # Worst-case loss = sl_dist + (entry_fee + exit_fee) per unit position.
+    # Per-unit fee cost ≈ 2 × (taker_fee_bps / 10000) × p.
+    fee_cost_per_unit = 2.0 * (config.taker_fee_bps / 10000.0) * p
+    effective_sl_dist = sl_dist + fee_cost_per_unit
+    raw_notional = (risk_amount / effective_sl_dist) * p
 
-    # Cap notional at max_position_frac × equity (without leverage scaling)
     max_notional_by_frac = equity_usd * config.max_position_frac
     notional = min(raw_notional, max_notional_by_frac)
 
-    # Cap by max leverage: notional cannot exceed equity × max_leverage
     max_notional_by_lev = equity_usd * config.max_leverage
     notional = min(notional, max_notional_by_lev)
 
@@ -163,28 +177,43 @@ def _build_decision(
             action="HOLD", symbol=signals.symbol, reason="notional <= 0 after caps"
         )
 
-    size = notional / p  # base units
+    # PATCH (severe fix #11): venue min notional check.
+    if notional < config.min_notional_usd:
+        return TradeDecision(
+            action="HOLD",
+            symbol=signals.symbol,
+            reason=(
+                f"notional ${notional:.2f} below venue minimum "
+                f"${config.min_notional_usd:.2f}; account too small for this "
+                f"risk_per_trade × sl_dist combination"
+            ),
+        )
+
+    size = notional / p
 
     if side == "LONG":
         stop_loss = p - sl_dist
         take_profit_1 = p + sl_dist * config.tp1_rr
         take_profit_2 = p + sl_dist * config.tp1_rr * 2.0
-    else:  # SHORT
+    else:
         stop_loss = p + sl_dist
         take_profit_1 = p - sl_dist * config.tp1_rr
         take_profit_2 = p - sl_dist * config.tp1_rr * 2.0
 
-    # Effective leverage = notional / margin used. For a 5x cap, the margin is
-    # notional / 5. We report the integer leverage the bot will set.
-    used_leverage = max(1, min(config.max_leverage, int(notional / equity_usd) + 1))
+    # PATCH: integer leverage now uses math.ceil semantics correctly.
+    import math
+    used_leverage = max(1, min(config.max_leverage, math.ceil(notional / equity_usd)))
 
+    score = (
+        signals.sweep_long_score if side == "LONG" else signals.sweep_short_score
+    )
     return TradeDecision(
         action=side,
         symbol=signals.symbol,
         reason=(
             f"{side} setup: F_z={signals.funding_zscore:+.2f}, "
-            f"liq cluster {min(signals.nearest_long_liq_bps, signals.nearest_short_liq_bps):.1f}bps, "
-            f"EMA ratio {signals.ema_ratio:.4f}, reversal bar confirmed"
+            f"sweep_score={score:.2f}, EMA ratio {signals.ema_ratio:.4f}, "
+            f"reversal bar confirmed"
         ),
         entry_price=p,
         size=size,

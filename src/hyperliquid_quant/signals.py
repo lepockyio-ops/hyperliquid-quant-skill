@@ -1,8 +1,30 @@
 """Deterministic signal computations.
 
-Ports the core logic of Vibe-Trading's `perp-funding-basis` and
-`liquidation-heatmap` skills to standalone numpy. All functions are pure —
-input data in, scalar/structured signals out. No I/O.
+PATCH NOTES (critical-issue fix #1):
+====================================
+The original `likely_liquidation_prices` / `nearest_cluster_distance_bps`
+used a fabricated "open interest by leverage" derived from L2 orderbook
+depth. That proxy was meaningless: the nearest computed cluster was
+always a fixed function of current price (e.g. p*(1-1/20) = 500bps away
+for the closest 20x bucket), so the default threshold of 10bps was
+unreachable and the bot would never trade.
+
+This patched version replaces the liquidation-cluster filter with a
+**liquidity-sweep / stop-hunt** filter using only real candle data:
+
+  LONG sweep:  in the last `sweep_lookback` bars the price made a new low
+               (below the prior swing low) and then closed BACK ABOVE that
+               prior swing low → stops below the swing got hit, then
+               price reclaimed → liquidity grab + reversal.
+  SHORT sweep: symmetric: new high above prior swing high then close
+               back below.
+
+We expose `sweep_long_score` / `sweep_short_score` in [0, 1] where 1
+means a textbook sweep happened on the most recent bar. The strategy
+then requires `score >= sweep_min_score` (configurable, default 0.6)
+in place of the old `near_liq_bps <= threshold` check.
+
+Everything else (funding Z-score, EMA, ATR, reversal flag) is unchanged.
 """
 
 from __future__ import annotations
@@ -13,29 +35,18 @@ import numpy as np
 
 
 # =============================================================================
-# Funding rate Z-score (perp-funding-basis)
+# Funding rate Z-score (unchanged from original)
 # =============================================================================
 
 
 def funding_zscore(funding_history: list[float], window: int = 90) -> float:
     """Z-score of the latest funding rate vs the trailing window.
 
-    Hyperliquid funding settles every hour; ``window=90`` ≈ 90 hours ≈ 3.75
-    days. For the conservative 30-day version used by some strategies, pass
-    ``window=720``. The current strategy uses ``window=90`` because Hyperliquid
-    funding is hourly and a long window dilutes the signal.
-
-    Args:
-        funding_history: list of recent funding rates, oldest first.
-        window: number of trailing samples to compute mean/std over.
-
-    Returns:
-        z-score of the most recent funding rate. 0 if window has zero variance.
+    Hyperliquid funding settles every hour; ``window=90`` ≈ 90 hours.
     """
     if len(funding_history) < window + 1:
-        # Not enough history — be safe, return 0 so strategy will HOLD.
         return 0.0
-    arr = np.asarray(funding_history[-(window + 1) :], dtype=float)
+    arr = np.asarray(funding_history[-(window + 1):], dtype=float)
     sample = arr[:-1]
     latest = arr[-1]
     std = float(np.std(sample))
@@ -44,88 +55,107 @@ def funding_zscore(funding_history: list[float], window: int = 90) -> float:
     return float((latest - float(np.mean(sample))) / std)
 
 
-def annualized_basis(perp_mid: float, spot_mid: float, funding_8h: float) -> float:
+def annualized_basis(perp_mid: float, spot_mid: float, funding_hourly: float) -> float:
     """Annualized basis = spot–perp premium plus funding carry.
+
+    PATCH: original used ``funding_8h * 3 * 365`` which was wrong because
+    Hyperliquid settles hourly. Fixed to 24 * 365 hourly settlements/yr.
 
     Returns a unitless fraction (0.02 = 2%/yr).
     """
     if spot_mid <= 0:
         return 0.0
     perp_premium = (perp_mid - spot_mid) / spot_mid
-    funding_annual = funding_8h * 3 * 365  # 3 settlements per day
+    funding_annual = funding_hourly * 24 * 365
     return perp_premium + funding_annual
 
 
 # =============================================================================
-# Liquidation heatmap (liquidation-heatmap)
+# Liquidity sweep / stop hunt detection
+# (replaces the broken OI-based liquidation cluster signal)
 # =============================================================================
 
 
 @dataclass
-class LiqCluster:
-    """A region of likely-liquidation prices."""
+class Candle:
+    """Local copy to keep this module pure (no cross-import to execution.py)."""
+    open: float
+    high: float
+    low: float
+    close: float
 
-    price: float
-    side: str  # "long_liq" (longs get liquidated below) or "short_liq"
-    intensity: float  # heuristic, higher = more open interest concentrated
+
+def _swing_low(lows: list[float], n_back: int) -> float:
+    """Lowest low in the last n_back bars EXCLUDING the most recent bar."""
+    if len(lows) < n_back + 1:
+        return float("nan")
+    return float(min(lows[-n_back - 1:-1]))
 
 
-def likely_liquidation_prices(
-    open_interest_by_leverage: dict[int, float],
-    current_price: float,
-    side: str,
-) -> list[LiqCluster]:
-    """Estimate likely liquidation price clusters.
+def _swing_high(highs: list[float], n_back: int) -> float:
+    if len(highs) < n_back + 1:
+        return float("nan")
+    return float(max(highs[-n_back - 1:-1]))
 
-    Liquidation price for an isolated position at leverage L (ignoring fees /
-    funding) is roughly::
 
-        long :  P_liq = entry × (1 - 1/L)
-        short:  P_liq = entry × (1 + 1/L)
+def sweep_scores(
+    highs: list[float],
+    lows: list[float],
+    opens: list[float],
+    closes: list[float],
+    sweep_lookback: int = 20,
+) -> tuple[float, float]:
+    """Compute long-side and short-side sweep scores from candle data.
 
-    For a cross-margin or maintenance-margin account the actual liquidation
-    is lower, but this approximation locates the clusters well enough for
-    short-term decision-making.
+    A *long sweep* is the classic "stop-hunt reversal" below a swing low:
+    - the current bar's LOW pierces the prior swing low (i.e. lows[-1] < swing_low)
+    - the current bar's CLOSE is back ABOVE the prior swing low
+    - score scales with how deep the wick went AND how far above the level it closed
 
     Args:
-        open_interest_by_leverage: {leverage_bucket: notional_open_interest}.
-            E.g., ``{3: 1_200_000, 5: 4_500_000, 10: 2_100_000}``.
-        current_price: current mark price; used as the proxy entry for the
-            recently-opened OI in each bucket.
-        side: "long" → return clusters where longs would be liquidated (below
-            price). "short" → where shorts would be liquidated (above price).
+        highs/lows/opens/closes: parallel arrays oldest-first.
+        sweep_lookback: how many bars define the "prior swing".
 
     Returns:
-        list of LiqCluster sorted by intensity descending.
+        (long_sweep_score, short_sweep_score) each in [0, 1].
+        0 means no sweep, 1 means a strong textbook sweep on the latest bar.
     """
-    if current_price <= 0:
-        return []
-    clusters: list[LiqCluster] = []
-    for lev, notional in open_interest_by_leverage.items():
-        if lev <= 1 or notional <= 0:
-            continue
-        if side == "long":
-            price = current_price * (1.0 - 1.0 / lev)
-            clusters.append(LiqCluster(price=price, side="long_liq", intensity=notional))
-        elif side == "short":
-            price = current_price * (1.0 + 1.0 / lev)
-            clusters.append(LiqCluster(price=price, side="short_liq", intensity=notional))
-    clusters.sort(key=lambda c: c.intensity, reverse=True)
-    return clusters
+    if min(len(highs), len(lows), len(opens), len(closes)) < sweep_lookback + 2:
+        return 0.0, 0.0
 
+    swing_lo = _swing_low(lows, sweep_lookback)
+    swing_hi = _swing_high(highs, sweep_lookback)
+    last_h = highs[-1]
+    last_l = lows[-1]
+    last_c = closes[-1]
+    last_o = opens[-1]
 
-def nearest_cluster_distance_bps(
-    clusters: list[LiqCluster],
-    current_price: float,
-) -> float:
-    """Distance in basis points from current price to the nearest cluster.
+    # Range of the last bar; used to normalise pierce/reclaim depth
+    bar_range = max(last_h - last_l, 1e-12)
 
-    Returns ``inf`` if there are no clusters.
-    """
-    if not clusters or current_price <= 0:
-        return float("inf")
-    distances = [abs(c.price - current_price) / current_price * 10000 for c in clusters]
-    return float(min(distances))
+    # ---- Long sweep: pierce below swing_lo, close back above ----
+    long_score = 0.0
+    if last_l < swing_lo and last_c > swing_lo:
+        pierce_depth = swing_lo - last_l         # how far below
+        reclaim = last_c - swing_lo              # how far back above
+        # both components must be meaningful relative to the bar range
+        pierce_frac = min(1.0, pierce_depth / bar_range)
+        reclaim_frac = min(1.0, reclaim / bar_range)
+        # also reward a bullish body
+        body_ok = 1.0 if last_c > last_o else 0.3
+        long_score = pierce_frac * reclaim_frac * body_ok
+
+    # ---- Short sweep: pierce above swing_hi, close back below ----
+    short_score = 0.0
+    if last_h > swing_hi and last_c < swing_hi:
+        pierce_depth = last_h - swing_hi
+        reclaim = swing_hi - last_c
+        pierce_frac = min(1.0, pierce_depth / bar_range)
+        reclaim_frac = min(1.0, reclaim / bar_range)
+        body_ok = 1.0 if last_c < last_o else 0.3
+        short_score = pierce_frac * reclaim_frac * body_ok
+
+    return float(long_score), float(short_score)
 
 
 # =============================================================================
@@ -164,11 +194,7 @@ def atr(highs: list[float], lows: list[float], closes: list[float], period: int 
 
 
 def reversal_candle(open_: float, close: float, side: str) -> bool:
-    """Did the last bar reverse in our favor?
-
-    side='long'  → close > open (bullish bar)
-    side='short' → close < open (bearish bar)
-    """
+    """Did the last bar reverse in our favor?"""
     if side == "long":
         return close > open_
     if side == "short":
@@ -183,16 +209,21 @@ def reversal_candle(open_: float, close: float, side: str) -> bool:
 
 @dataclass
 class SignalVector:
-    """All signals needed by the strategy formula. Pure data, JSON-serialisable."""
+    """All signals needed by the strategy formula. Pure data, JSON-serialisable.
+
+    PATCH: replaced ``nearest_long_liq_bps`` / ``nearest_short_liq_bps`` with
+    ``sweep_long_score`` / ``sweep_short_score``. Strategy.evaluate() updated
+    accordingly.
+    """
 
     symbol: str
     current_price: float
     funding_zscore: float
-    nearest_long_liq_bps: float
-    nearest_short_liq_bps: float
+    sweep_long_score: float
+    sweep_short_score: float
     ema_fast: float
     ema_slow: float
-    ema_ratio: float  # ema_fast / ema_slow
+    ema_ratio: float
     atr_15m: float
     last_candle_bullish: bool
     last_candle_bearish: bool
@@ -202,8 +233,8 @@ class SignalVector:
             "symbol": self.symbol,
             "current_price": self.current_price,
             "funding_zscore": self.funding_zscore,
-            "nearest_long_liq_bps": self.nearest_long_liq_bps,
-            "nearest_short_liq_bps": self.nearest_short_liq_bps,
+            "sweep_long_score": self.sweep_long_score,
+            "sweep_short_score": self.sweep_short_score,
             "ema_fast": self.ema_fast,
             "ema_slow": self.ema_slow,
             "ema_ratio": self.ema_ratio,
