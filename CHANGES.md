@@ -1,3 +1,16 @@
+# hyperliquid-quant-skill changes
+
+## 2026-05-16 — Freqtrade repaired V2 artifact upload
+
+Added `artifacts/freqtrade-repaired-v2/` with the current best-performing FreqAI repair candidate snapshot:
+
+- `HLAdaptiveTrendFreqAIRepaired.py`
+- `HLAdaptiveTrendFreqAIRepairedV2.py`
+- `test_hl_adaptive_trend_freqai_repaired_v2.py`
+- README documenting the backtest comparison and why V2 was kept
+
+---
+
 # hyperliquid-quant-skill v0.3 — Critical + Severe fixes
 
 This patch resolves the 5 critical (🟥) and 5 severe (🟧) issues from the audit.
