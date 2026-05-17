@@ -10,7 +10,7 @@ Exposes 8 MCP tools that let an agent run a fully mechanical short-term strategy
 |---|---|
 | `hl_get_account_state` | Read balance, positions, margin usage |
 | `hl_get_market_data` | Mid price, funding, 24h volume, recent candles |
-| `hl_compute_signals` | Funding Z-score + liquidation cluster proximity + EMA/ATR (formulaic) |
+| `hl_compute_signals` | Funding filter + 15m sweep trigger + 1h/15m EMA context + ATR |
 | `hl_evaluate_strategy` | Apply the full entry/exit formula → BUY / SELL / HOLD decision |
 | `hl_risk_check` | L4 risk guard — daily loss cap, consecutive losses, margin %, news blackout |
 | `hl_place_order` | Place a perp order with mandatory stop-loss and take-profit |
@@ -84,12 +84,12 @@ Add to `claude_desktop_config.json`:
   Market data (Hyperliquid WS/REST)
             │
             ▼
-  Signals: funding Z-score, liquidation cluster, EMA/ATR
+  Signals: funding filter, 15m liquidity sweep, 1h trend, EMA/ATR
             │
             ▼
   Strategy formula (deterministic)
-   ├─ Long  if F_z < -2.0 AND price near lower liq cluster AND EMA fast > slow × 0.998 AND last 15m candle reversal
-   └─ Short if F_z > +2.0 AND price near upper liq cluster AND EMA fast < slow × 1.002 AND last 15m candle reversal
+   ├─ Long  if 1h trend up AND 15m sweep reclaims lows AND funding not crowded long AND last 15m candle confirms
+   └─ Short if 1h trend down AND 15m sweep rejects highs AND funding not crowded short AND last 15m candle confirms
             │
             ▼
   Risk guards (any failure → reject)
@@ -131,7 +131,7 @@ hyperliquid-quant-skill/
 │   ├── __init__.py
 │   ├── config.py                     # Env loader
 │   ├── execution.py                  # Hyperliquid SDK wrapper
-│   ├── signals.py                    # Funding / liquidation / TA signals
+│   ├── signals.py                    # Funding / sweep / trend signals
 │   ├── strategy.py                   # The deterministic formula
 │   ├── risk.py                       # L4 risk guards
 │   └── mcp_server.py                 # MCP entrypoint (stdio)

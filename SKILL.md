@@ -3,8 +3,8 @@ name: hyperliquid-quant
 version: 0.1.0
 description: |
   Formulaic short-term quantitative trading on Hyperliquid perpetuals. Provides
-  deterministic signal generation (funding rate Z-score, liquidation cluster
-  proximity, EMA/ATR), strategy evaluation, risk guards, and order execution
+  deterministic signal generation (funding filter, 15m liquidity sweep,
+  1h/15m EMA context, ATR), strategy evaluation, risk guards, and order execution
   via the official Hyperliquid Python SDK. The agent MUST follow the
   Decision Protocol below — no discretionary trades.
 license: MIT
@@ -36,11 +36,13 @@ negative result, stop and report — do not advance.**
 1. **`hl_get_account_state`** — confirm equity, current positions, margin
    usage. If margin usage > 60% or symbol already has a position, abort.
 2. **`hl_get_market_data`** — fetch the latest market data for the candidate
-   symbol (15m candles, funding rate, orderbook depth).
+   symbol (15m candles, 1h candles, funding rate).
 3. **`hl_compute_signals`** — get the deterministic signal vector:
-   - `funding_zscore` (30-day window)
-   - `liquidation_cluster_proximity_bps`
-   - `ema_fast_over_slow_ratio`
+   - `funding_zscore` (filter, not primary trigger)
+   - `sweep_long_score` / `sweep_short_score`
+   - `sweep_long_age_bars` / `sweep_short_age_bars`
+   - `ema_ratio` (15m)
+   - `ema_htf_ratio` (1h)
    - `reversal_candle_flag`
    - `atr_15m`
 4. **`hl_evaluate_strategy`** — apply the formula. Returns one of:
@@ -57,16 +59,15 @@ negative result, stop and report — do not advance.**
 
 ## Exit Protocol
 
-The strategy uses bracket orders (entry + SL + TP1 + TP2 placed atomically).
-You do NOT need to monitor positions to manually exit. The only manual
-exit you should perform is:
+The strategy now uses:
 
-- If the user explicitly asks: call `hl_close_position` with reduce-only.
-- If a black-swan condition is detected externally and the user instructs
-  emergency shutdown: call `hl_close_position` for every open position.
+- initial stop-loss at entry
+- TP1 near 1R
+- server-side stop management after TP1 / favorable excursion
+- no-progress exit if the trade stalls for too many 15m bars
 
-You MUST NOT close a winning trade early, scale out manually, or move a
-stop-loss after entry. The formula handles all exits.
+You should still not invent discretionary exits, but `hl_get_account_state`
+is expected to keep the protective stop aligned with the rules.
 
 ## Hard Constraints (NEVER VIOLATE)
 

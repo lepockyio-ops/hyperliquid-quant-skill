@@ -1,4 +1,4 @@
-"""Smoke tests for the pure-function layers. No network, no SDK required."""
+"""Smoke tests for the pure-function layers."""
 
 from __future__ import annotations
 
@@ -8,26 +8,13 @@ import pytest
 
 from hyperliquid_quant.config import Config
 from hyperliquid_quant.risk import AccountSnapshot, RiskCheckResult, StateStore, check_trade
-from hyperliquid_quant.signals import (
-    SignalVector,
-    atr,
-    ema,
-    funding_zscore,
-    likely_liquidation_prices,
-    nearest_cluster_distance_bps,
-    reversal_candle,
-)
+from hyperliquid_quant.signals import SignalVector, atr, ema, funding_zscore, reversal_candle, sweep_scores
 from hyperliquid_quant.strategy import evaluate
 
 
 def _cfg(**overrides) -> Config:
     base = Config()
     return replace(base, **overrides) if overrides else base
-
-
-# =============================================================================
-# Signal tests
-# =============================================================================
 
 
 def test_funding_zscore_zero_when_no_history():
@@ -37,9 +24,9 @@ def test_funding_zscore_zero_when_no_history():
 
 def test_funding_zscore_detects_extreme_negative():
     base = [0.0001] * 90
-    series = base + [-0.005]  # massive negative funding
+    series = base + [-0.005]
     z = funding_zscore(series, window=90)
-    assert z < -3, f"expected strong negative z, got {z}"
+    assert z < -3
 
 
 def test_ema_returns_finite():
@@ -64,26 +51,23 @@ def test_reversal_candle():
     assert reversal_candle(100, 101, "short") is False
 
 
-def test_liq_clusters_long_below_short_above():
-    price = 1000.0
-    oi = {3: 100, 5: 200, 10: 300}
-    longs = likely_liquidation_prices(oi, price, "long")
-    shorts = likely_liquidation_prices(oi, price, "short")
-    assert all(c.price < price for c in longs)
-    assert all(c.price > price for c in shorts)
-
-
-def test_cluster_distance_bps():
-    from hyperliquid_quant.signals import LiqCluster
-
-    clusters = [LiqCluster(price=1010, side="short_liq", intensity=1)]
-    d = nearest_cluster_distance_bps(clusters, 1000.0)
-    assert abs(d - 100.0) < 0.01
-
-
-# =============================================================================
-# Strategy tests
-# =============================================================================
+def test_sweep_scores_pick_recent_confirmation_window():
+    highs = [100, 101, 102, 103, 104, 105, 95.9, 96.2]
+    lows = [99, 98, 97, 96, 95, 94, 92.0, 94.5]
+    opens = [99.5, 100, 101, 102, 103, 104, 92.3, 95.0]
+    closes = [100, 101, 102, 103, 104, 105, 95.7, 95.6]
+    long_score, short_score, long_age, short_age = sweep_scores(
+        highs,
+        lows,
+        opens,
+        closes,
+        sweep_lookback=5,
+        confirmation_bars=2,
+    )
+    assert long_score > 0.5
+    assert short_score == 0.0
+    assert long_age in (0, 1)
+    assert short_age == 999
 
 
 def _build_signals(**kw) -> SignalVector:
@@ -91,11 +75,16 @@ def _build_signals(**kw) -> SignalVector:
         symbol="ETH",
         current_price=2000.0,
         funding_zscore=0.0,
-        nearest_long_liq_bps=999.0,
-        nearest_short_liq_bps=999.0,
+        sweep_long_score=0.0,
+        sweep_short_score=0.0,
+        sweep_long_age_bars=999,
+        sweep_short_age_bars=999,
         ema_fast=2000.0,
         ema_slow=2000.0,
         ema_ratio=1.0,
+        ema_htf_fast=2020.0,
+        ema_htf_slow=2000.0,
+        ema_htf_ratio=1.01,
         atr_15m=5.0,
         last_candle_bullish=False,
         last_candle_bearish=False,
@@ -112,9 +101,11 @@ def test_hold_when_no_edge():
 
 def test_long_when_all_conditions_met():
     sig = _build_signals(
-        funding_zscore=-2.5,
-        nearest_long_liq_bps=5.0,
-        ema_ratio=1.0,
+        funding_zscore=-0.3,
+        sweep_long_score=0.8,
+        sweep_long_age_bars=0,
+        ema_ratio=1.001,
+        ema_htf_ratio=1.004,
         last_candle_bullish=True,
     )
     d = evaluate(sig, equity_usd=10_000, config=_cfg())
@@ -126,9 +117,11 @@ def test_long_when_all_conditions_met():
 
 def test_short_when_all_conditions_met():
     sig = _build_signals(
-        funding_zscore=2.5,
-        nearest_short_liq_bps=5.0,
-        ema_ratio=1.0,
+        funding_zscore=0.3,
+        sweep_short_score=0.8,
+        sweep_short_age_bars=0,
+        ema_ratio=0.999,
+        ema_htf_ratio=0.996,
         last_candle_bearish=True,
     )
     d = evaluate(sig, equity_usd=10_000, config=_cfg())
@@ -137,40 +130,50 @@ def test_short_when_all_conditions_met():
     assert d.take_profit_1 < d.entry_price
 
 
+def test_crowded_positive_funding_blocks_long():
+    sig = _build_signals(
+        funding_zscore=1.5,
+        sweep_long_score=0.8,
+        sweep_long_age_bars=0,
+        ema_ratio=1.001,
+        ema_htf_ratio=1.004,
+        last_candle_bullish=True,
+    )
+    d = evaluate(sig, equity_usd=10_000, config=_cfg())
+    assert d.action == "HOLD"
+
+
 def test_position_sizing_respects_risk_per_trade():
     sig = _build_signals(
-        funding_zscore=-2.5,
-        nearest_long_liq_bps=5.0,
-        ema_ratio=1.0,
+        funding_zscore=-0.2,
+        sweep_long_score=0.8,
+        sweep_long_age_bars=0,
+        ema_ratio=1.001,
+        ema_htf_ratio=1.004,
         last_candle_bullish=True,
     )
     equity = 10_000.0
     cfg = _cfg()
     d = evaluate(sig, equity_usd=equity, config=cfg)
-    # Risk = (entry - SL) × size ≈ risk_per_trade × equity, within sizing caps
     risk_dollar = (d.entry_price - d.stop_loss) * d.size
     expected = equity * cfg.risk_per_trade
-    # Should be ≤ expected (caps may reduce, never exceed)
     assert risk_dollar <= expected * 1.01
 
 
 def test_position_capped_by_max_position_frac():
     sig = _build_signals(
-        funding_zscore=-2.5,
-        nearest_long_liq_bps=5.0,
-        ema_ratio=1.0,
+        funding_zscore=-0.2,
+        sweep_long_score=0.8,
+        sweep_long_age_bars=0,
+        ema_ratio=1.001,
+        ema_htf_ratio=1.004,
         last_candle_bullish=True,
-        atr_15m=0.01,  # tiny ATR → would otherwise size huge
+        atr_15m=0.01,
     )
     equity = 10_000.0
     cfg = _cfg()
     d = evaluate(sig, equity_usd=equity, config=cfg)
     assert d.notional <= equity * cfg.max_position_frac * 1.01
-
-
-# =============================================================================
-# Risk-guard tests
-# =============================================================================
 
 
 @pytest.fixture
@@ -189,8 +192,8 @@ def _winning_long_decision():
         size=0.5,
         notional=1000,
         stop_loss=1990,
-        take_profit_1=2015,
-        take_profit_2=2030,
+        take_profit_1=2010,
+        take_profit_2=2018,
         leverage=2,
         risk_amount=50,
         sl_distance=10,
@@ -236,7 +239,7 @@ def test_risk_reject_missing_stop_loss(tmp_state):
 
 def test_risk_reject_wrong_side_sl(tmp_state):
     d = _winning_long_decision()
-    d.stop_loss = d.entry_price + 10  # wrong side for long
+    d.stop_loss = d.entry_price + 10
     acct = AccountSnapshot(equity_usd=10_000, margin_used_usd=0, positions=[])
     r = check_trade(d, acct, tmp_state, _cfg())
     assert not r.passed

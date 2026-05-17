@@ -1,19 +1,4 @@
-"""The deterministic strategy formula.
-
-Pure function: market data + config → trade decision. No I/O, no LLM input.
-
-PATCH NOTES (critical-issue fix #1):
-====================================
-Replaced the broken liquidation-cluster filter:
-    OLD: signals.nearest_long_liq_bps <= config.liq_proximity_bps
-    NEW: signals.sweep_long_score    >= config.sweep_min_score
-See signals.py for the new definition. The old proxy was a fixed function
-of price and never satisfied the default threshold.
-
-Also tightened the EMA filter (the old `> 0.998` was a no-op): now requires
-ema_fast/ema_slow to confirm trend by at least `ema_trend_min` (default
-0.5%). Strategies that want pure mean-reversion can set this to 0.
-"""
+"""The deterministic strategy formula."""
 
 from __future__ import annotations
 
@@ -68,15 +53,14 @@ def evaluate(
 ) -> TradeDecision:
     """Apply the entry formula.
 
-    Long  triggers when:  F_z < -funding_z_threshold
-                          AND sweep_long_score >= sweep_min_score
-                          AND ema_ratio - 1 > +ema_trend_min  (uptrend)
-                          AND last_candle_bullish
+    Long  triggers when:
+        - 1h EMA fast > EMA slow by ema_trend_min
+        - 15m EMA fast >= EMA slow
+        - recent long sweep score >= sweep_min_score
+        - funding is not too crowded on the long side
+        - latest candle confirms upward follow-through
 
-    Short triggers when:  F_z > +funding_z_threshold
-                          AND sweep_short_score >= sweep_min_score
-                          AND ema_ratio - 1 < -ema_trend_min  (downtrend)
-                          AND last_candle_bearish
+    Short triggers when the symmetric short conditions hold.
 
     Otherwise HOLD.
     """
@@ -85,48 +69,72 @@ def evaluate(
     if p <= 0:
         return TradeDecision(action="HOLD", symbol=signals.symbol, reason="invalid price")
 
-    trend = signals.ema_ratio - 1.0
+    trend_15m = signals.ema_ratio - 1.0
+    trend_1h = signals.ema_htf_ratio - 1.0
 
-    # ---- Long branch ----------------------------------------------------
-    long_funding_ok = fz < -config.funding_z_threshold
+    long_funding_ok = fz <= config.funding_z_threshold
     long_sweep_ok = signals.sweep_long_score >= config.sweep_min_score
-    long_trend_ok = trend > config.ema_trend_min
+    long_trigger_trend_ok = trend_15m >= 0
+    long_trend_ok = trend_1h > config.ema_trend_min
     long_reversal_ok = signals.last_candle_bullish
+    long_sweep_fresh = signals.sweep_long_age_bars < config.sweep_confirmation_bars
 
-    if long_funding_ok and long_sweep_ok and long_trend_ok and long_reversal_ok:
+    if (
+        long_funding_ok
+        and long_sweep_ok
+        and long_trigger_trend_ok
+        and long_trend_ok
+        and long_reversal_ok
+        and long_sweep_fresh
+    ):
         return _build_decision(
             side="LONG", signals=signals, equity_usd=equity_usd, config=config
         )
 
-    # ---- Short branch ---------------------------------------------------
-    short_funding_ok = fz > config.funding_z_threshold
+    short_funding_ok = fz >= -config.funding_z_threshold
     short_sweep_ok = signals.sweep_short_score >= config.sweep_min_score
-    short_trend_ok = trend < -config.ema_trend_min
+    short_trigger_trend_ok = trend_15m <= 0
+    short_trend_ok = trend_1h < -config.ema_trend_min
     short_reversal_ok = signals.last_candle_bearish
+    short_sweep_fresh = signals.sweep_short_age_bars < config.sweep_confirmation_bars
 
-    if short_funding_ok and short_sweep_ok and short_trend_ok and short_reversal_ok:
+    if (
+        short_funding_ok
+        and short_sweep_ok
+        and short_trigger_trend_ok
+        and short_trend_ok
+        and short_reversal_ok
+        and short_sweep_fresh
+    ):
         return _build_decision(
             side="SHORT", signals=signals, equity_usd=equity_usd, config=config
         )
 
-    # ---- No setup -------------------------------------------------------
     reasons = []
-    if not (long_funding_ok or short_funding_ok):
-        reasons.append(
-            f"funding_z={fz:+.2f} within ±{config.funding_z_threshold}"
-        )
+    if not long_funding_ok and not short_funding_ok:
+        reasons.append(f"funding_z={fz:+.2f} outside filter window")
     if not (long_sweep_ok or short_sweep_ok):
         reasons.append(
             f"no sweep (long={signals.sweep_long_score:.2f}, "
             f"short={signals.sweep_short_score:.2f}, "
-            f"need ≥{config.sweep_min_score})"
+            f"need >={config.sweep_min_score})"
+        )
+    if not (long_sweep_fresh or short_sweep_fresh):
+        reasons.append(
+            f"sweep too old (long_age={signals.sweep_long_age_bars}, short_age={signals.sweep_short_age_bars})"
         )
     if not (long_trend_ok or short_trend_ok):
         reasons.append(
-            f"trend={trend:+.4f} within ±{config.ema_trend_min}"
+            f"1h trend={trend_1h:+.4f} within ±{config.ema_trend_min}"
         )
+    if not (long_trigger_trend_ok or short_trigger_trend_ok):
+        reasons.append(f"15m trigger trend={trend_15m:+.4f} misaligned")
     if not (long_reversal_ok or short_reversal_ok):
         reasons.append("last candle not a reversal in any direction")
+    if long_funding_ok and not short_funding_ok and not (long_sweep_ok and long_trend_ok):
+        reasons.append("short side blocked by crowded negative funding")
+    if short_funding_ok and not long_funding_ok and not (short_sweep_ok and short_trend_ok):
+        reasons.append("long side blocked by crowded positive funding")
 
     return TradeDecision(
         action="HOLD",
@@ -135,11 +143,33 @@ def evaluate(
     )
 
 
-# =============================================================================
-# Position sizing (deterministic, mostly unchanged)
-# =============================================================================
+def _breakeven_price(
+    *,
+    side: Literal["LONG", "SHORT"],
+    price: float,
+    config: Config,
+) -> float:
+    buffer = config.breakeven_buffer_bps / 10000.0
+    fee_buffer = 2.0 * (config.taker_fee_bps / 10000.0)
+    if side == "LONG":
+        return price * (1.0 + buffer + fee_buffer)
+    return price * (1.0 - buffer - fee_buffer)
 
 
+def _trail_anchor_price(
+    *,
+    side: Literal["LONG", "SHORT"],
+    entry: float,
+    sl_dist: float,
+    config: Config,
+) -> float:
+    """Optional second target used as a hard cap if the trailing layer is inactive."""
+    if side == "LONG":
+        return entry + sl_dist * max(config.tp1_rr + 0.8, 1.8)
+    return entry - sl_dist * max(config.tp1_rr + 0.8, 1.8)
+
+
+# =============================================================================
 def _build_decision(
     *,
     side: Literal["LONG", "SHORT"],
@@ -194,13 +224,12 @@ def _build_decision(
     if side == "LONG":
         stop_loss = p - sl_dist
         take_profit_1 = p + sl_dist * config.tp1_rr
-        take_profit_2 = p + sl_dist * config.tp1_rr * 2.0
+        take_profit_2 = _trail_anchor_price(side=side, entry=p, sl_dist=sl_dist, config=config)
     else:
         stop_loss = p + sl_dist
         take_profit_1 = p - sl_dist * config.tp1_rr
-        take_profit_2 = p - sl_dist * config.tp1_rr * 2.0
+        take_profit_2 = _trail_anchor_price(side=side, entry=p, sl_dist=sl_dist, config=config)
 
-    # PATCH: integer leverage now uses math.ceil semantics correctly.
     import math
     used_leverage = max(1, min(config.max_leverage, math.ceil(notional / equity_usd)))
 
@@ -212,8 +241,9 @@ def _build_decision(
         symbol=signals.symbol,
         reason=(
             f"{side} setup: F_z={signals.funding_zscore:+.2f}, "
-            f"sweep_score={score:.2f}, EMA ratio {signals.ema_ratio:.4f}, "
-            f"reversal bar confirmed"
+            f"sweep_score={score:.2f}, 1h EMA ratio {signals.ema_htf_ratio:.4f}, "
+            f"15m EMA ratio {signals.ema_ratio:.4f}, "
+            f"tp1 at 1R then protect via breakeven/trailing"
         ),
         entry_price=p,
         size=size,

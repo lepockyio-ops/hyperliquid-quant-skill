@@ -446,47 +446,33 @@ class HyperliquidClient:
 
         # ---- 3. Recompute SL/TP relative to actual fill --------------------
         if is_buy:
-            sl_dist = entry_price - stop_loss          # original distance
+            sl_dist = entry_price - stop_loss
             tp1_dist = take_profit_1 - entry_price
+            tp2_dist = take_profit_2 - entry_price if take_profit_2 else None
         else:
             sl_dist = stop_loss - entry_price
             tp1_dist = entry_price - take_profit_1
+            tp2_dist = entry_price - take_profit_2 if take_profit_2 else None
 
         if is_buy:
             sl_actual = avg_fill_px - sl_dist
             tp1_actual = avg_fill_px + tp1_dist
-            tp2_actual = avg_fill_px + 2 * tp1_dist if take_profit_2 else None
+            tp2_actual = avg_fill_px + tp2_dist if tp2_dist is not None else None
         else:
             sl_actual = avg_fill_px + sl_dist
             tp1_actual = avg_fill_px - tp1_dist
-            tp2_actual = avg_fill_px - 2 * tp1_dist if take_profit_2 else None
+            tp2_actual = avg_fill_px - tp2_dist if tp2_dist is not None else None
 
         sl_actual = self._round_price(sl_actual)
         tp1_actual = self._round_price(tp1_actual)
         tp2_actual = self._round_price(tp2_actual) if tp2_actual else None
 
-        # ---- 4. Place SL with slippage-bounded limit ----------------------
-        # For a LONG: closing side is SELL; worst tolerable price = sl_actual * (1 - bps)
-        bps = self.config.sl_slippage_bps / 10000.0
-        if is_buy:
-            sl_limit_px = self._round_price(sl_actual * (1 - bps))
-        else:
-            sl_limit_px = self._round_price(sl_actual * (1 + bps))
-
         try:
-            sl_resp = self.exchange.order(
-                name=coin,
-                is_buy=not is_buy,
-                sz=filled_size,
-                limit_px=sl_limit_px,
-                order_type={
-                    "trigger": {
-                        "isMarket": False,
-                        "triggerPx": sl_actual,
-                        "tpsl": "sl",
-                    }
-                },
-                reduce_only=True,
+            sl_resp = self.place_stop_loss(
+                coin=coin,
+                is_long=is_buy,
+                size=filled_size,
+                trigger_px=sl_actual,
             )
             result.sl_status = "submitted"
             result.sl_oid = _extract_oid(sl_resp)
@@ -572,6 +558,49 @@ class HyperliquidClient:
             order_type={"limit": {"tif": "Ioc"}},
             reduce_only=True,
         )
+
+    def place_stop_loss(
+        self,
+        *,
+        coin: str,
+        is_long: bool,
+        size: float,
+        trigger_px: float,
+    ) -> dict[str, Any]:
+        """Place a reduce-only trigger stop using the configured slippage cap."""
+        self._require_armed_mainnet()
+        rounded_size = self._round_size(coin, size)
+        if rounded_size <= 0:
+            raise RuntimeError("rounded stop-loss size <= 0")
+        rounded_trigger = self._round_price(trigger_px)
+        bps = self.config.sl_slippage_bps / 10000.0
+        if is_long:
+            sl_limit_px = self._round_price(rounded_trigger * (1 - bps))
+        else:
+            sl_limit_px = self._round_price(rounded_trigger * (1 + bps))
+        return self.exchange.order(
+            name=coin,
+            is_buy=not is_long,
+            sz=rounded_size,
+            limit_px=sl_limit_px,
+            order_type={
+                "trigger": {
+                    "isMarket": False,
+                    "triggerPx": rounded_trigger,
+                    "tpsl": "sl",
+                }
+            },
+            reduce_only=True,
+        )
+
+    def cancel_many(self, coin: str, oids: list[int]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for oid in oids:
+            try:
+                results.append(self.cancel(coin, oid))
+            except Exception as e:
+                results.append({"oid": oid, "error": str(e)})
+        return results
 
     def cancel(self, coin: str, oid: int) -> dict[str, Any]:
         self._require_armed_mainnet()

@@ -1,31 +1,4 @@
-"""Deterministic signal computations.
-
-PATCH NOTES (critical-issue fix #1):
-====================================
-The original `likely_liquidation_prices` / `nearest_cluster_distance_bps`
-used a fabricated "open interest by leverage" derived from L2 orderbook
-depth. That proxy was meaningless: the nearest computed cluster was
-always a fixed function of current price (e.g. p*(1-1/20) = 500bps away
-for the closest 20x bucket), so the default threshold of 10bps was
-unreachable and the bot would never trade.
-
-This patched version replaces the liquidation-cluster filter with a
-**liquidity-sweep / stop-hunt** filter using only real candle data:
-
-  LONG sweep:  in the last `sweep_lookback` bars the price made a new low
-               (below the prior swing low) and then closed BACK ABOVE that
-               prior swing low → stops below the swing got hit, then
-               price reclaimed → liquidity grab + reversal.
-  SHORT sweep: symmetric: new high above prior swing high then close
-               back below.
-
-We expose `sweep_long_score` / `sweep_short_score` in [0, 1] where 1
-means a textbook sweep happened on the most recent bar. The strategy
-then requires `score >= sweep_min_score` (configurable, default 0.6)
-in place of the old `near_liq_bps <= threshold` check.
-
-Everything else (funding Z-score, EMA, ATR, reversal flag) is unchanged.
-"""
+"""Deterministic signal computations."""
 
 from __future__ import annotations
 
@@ -98,64 +71,81 @@ def _swing_high(highs: list[float], n_back: int) -> float:
     return float(max(highs[-n_back - 1:-1]))
 
 
-def sweep_scores(
+def _single_bar_sweep_score(
     highs: list[float],
     lows: list[float],
     opens: list[float],
     closes: list[float],
-    sweep_lookback: int = 20,
+    sweep_lookback: int,
+    idx: int,
 ) -> tuple[float, float]:
-    """Compute long-side and short-side sweep scores from candle data.
-
-    A *long sweep* is the classic "stop-hunt reversal" below a swing low:
-    - the current bar's LOW pierces the prior swing low (i.e. lows[-1] < swing_low)
-    - the current bar's CLOSE is back ABOVE the prior swing low
-    - score scales with how deep the wick went AND how far above the level it closed
-
-    Args:
-        highs/lows/opens/closes: parallel arrays oldest-first.
-        sweep_lookback: how many bars define the "prior swing".
-
-    Returns:
-        (long_sweep_score, short_sweep_score) each in [0, 1].
-        0 means no sweep, 1 means a strong textbook sweep on the latest bar.
-    """
-    if min(len(highs), len(lows), len(opens), len(closes)) < sweep_lookback + 2:
+    """Compute weighted sweep scores for one bar index."""
+    if idx < sweep_lookback or idx >= len(closes):
         return 0.0, 0.0
 
-    swing_lo = _swing_low(lows, sweep_lookback)
-    swing_hi = _swing_high(highs, sweep_lookback)
-    last_h = highs[-1]
-    last_l = lows[-1]
-    last_c = closes[-1]
-    last_o = opens[-1]
+    window_start = idx - sweep_lookback
+    swing_lo = float(min(lows[window_start:idx]))
+    swing_hi = float(max(highs[window_start:idx]))
+    last_h = highs[idx]
+    last_l = lows[idx]
+    last_c = closes[idx]
+    last_o = opens[idx]
 
-    # Range of the last bar; used to normalise pierce/reclaim depth
     bar_range = max(last_h - last_l, 1e-12)
 
-    # ---- Long sweep: pierce below swing_lo, close back above ----
     long_score = 0.0
     if last_l < swing_lo and last_c > swing_lo:
-        pierce_depth = swing_lo - last_l         # how far below
-        reclaim = last_c - swing_lo              # how far back above
-        # both components must be meaningful relative to the bar range
+        pierce_depth = swing_lo - last_l
+        reclaim = last_c - swing_lo
         pierce_frac = min(1.0, pierce_depth / bar_range)
         reclaim_frac = min(1.0, reclaim / bar_range)
-        # also reward a bullish body
-        body_ok = 1.0 if last_c > last_o else 0.3
-        long_score = pierce_frac * reclaim_frac * body_ok
+        body_frac = min(1.0, max(0.0, last_c - last_o) / bar_range)
+        long_score = 0.45 * pierce_frac + 0.35 * reclaim_frac + 0.20 * body_frac
 
-    # ---- Short sweep: pierce above swing_hi, close back below ----
     short_score = 0.0
     if last_h > swing_hi and last_c < swing_hi:
         pierce_depth = last_h - swing_hi
         reclaim = swing_hi - last_c
         pierce_frac = min(1.0, pierce_depth / bar_range)
         reclaim_frac = min(1.0, reclaim / bar_range)
-        body_ok = 1.0 if last_c < last_o else 0.3
-        short_score = pierce_frac * reclaim_frac * body_ok
+        body_frac = min(1.0, max(0.0, last_o - last_c) / bar_range)
+        short_score = 0.45 * pierce_frac + 0.35 * reclaim_frac + 0.20 * body_frac
 
     return float(long_score), float(short_score)
+
+
+def sweep_scores(
+    highs: list[float],
+    lows: list[float],
+    opens: list[float],
+    closes: list[float],
+    sweep_lookback: int = 20,
+    confirmation_bars: int = 2,
+) -> tuple[float, float, int, int]:
+    """Compute best sweep scores across the most recent confirmation window."""
+    if min(len(highs), len(lows), len(opens), len(closes)) < sweep_lookback + 2:
+        return 0.0, 0.0, 999, 999
+
+    best_long = 0.0
+    best_short = 0.0
+    best_long_age = 999
+    best_short_age = 999
+    last_idx = len(closes) - 1
+    max_lookback = min(confirmation_bars, last_idx)
+
+    for age in range(max_lookback):
+        idx = last_idx - age
+        long_score, short_score = _single_bar_sweep_score(
+            highs, lows, opens, closes, sweep_lookback, idx
+        )
+        if long_score > best_long:
+            best_long = long_score
+            best_long_age = age
+        if short_score > best_short:
+            best_short = short_score
+            best_short_age = age
+
+    return float(best_long), float(best_short), best_long_age, best_short_age
 
 
 # =============================================================================
@@ -211,9 +201,7 @@ def reversal_candle(open_: float, close: float, side: str) -> bool:
 class SignalVector:
     """All signals needed by the strategy formula. Pure data, JSON-serialisable.
 
-    PATCH: replaced ``nearest_long_liq_bps`` / ``nearest_short_liq_bps`` with
-    ``sweep_long_score`` / ``sweep_short_score``. Strategy.evaluate() updated
-    accordingly.
+    Captures the higher-timeframe trend and short-term trigger context.
     """
 
     symbol: str
@@ -221,9 +209,14 @@ class SignalVector:
     funding_zscore: float
     sweep_long_score: float
     sweep_short_score: float
+    sweep_long_age_bars: int
+    sweep_short_age_bars: int
     ema_fast: float
     ema_slow: float
     ema_ratio: float
+    ema_htf_fast: float
+    ema_htf_slow: float
+    ema_htf_ratio: float
     atr_15m: float
     last_candle_bullish: bool
     last_candle_bearish: bool
@@ -235,9 +228,14 @@ class SignalVector:
             "funding_zscore": self.funding_zscore,
             "sweep_long_score": self.sweep_long_score,
             "sweep_short_score": self.sweep_short_score,
+            "sweep_long_age_bars": self.sweep_long_age_bars,
+            "sweep_short_age_bars": self.sweep_short_age_bars,
             "ema_fast": self.ema_fast,
             "ema_slow": self.ema_slow,
             "ema_ratio": self.ema_ratio,
+            "ema_htf_fast": self.ema_htf_fast,
+            "ema_htf_slow": self.ema_htf_slow,
+            "ema_htf_ratio": self.ema_htf_ratio,
             "atr_15m": self.atr_15m,
             "last_candle_bullish": self.last_candle_bullish,
             "last_candle_bearish": self.last_candle_bearish,

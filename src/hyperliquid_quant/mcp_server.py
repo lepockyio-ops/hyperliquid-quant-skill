@@ -110,6 +110,207 @@ def _maybe_enforce_max_hold(client: HyperliquidClient, state: StateStore) -> dic
     }
 
 
+def _cancel_open_trade_orders(client: HyperliquidClient, trade: dict) -> list[dict[str, Any]]:
+    symbol = trade.get("symbol")
+    if not symbol:
+        return []
+    oids = [
+        int(oid)
+        for oid in (
+            trade.get("sl_oid"),
+            trade.get("tp1_oid"),
+            trade.get("tp2_oid"),
+        )
+        if oid
+    ]
+    if not oids:
+        return []
+    return client.cancel_many(symbol, oids)
+
+
+def _maybe_manage_open_trade(client: HyperliquidClient, state: StateStore) -> dict | None:
+    trade = state.open_trade
+    if not trade:
+        return None
+
+    symbol = trade.get("symbol")
+    if not symbol:
+        state.set_open_trade(None)
+        return {"status": "cleared_invalid_trade_state"}
+
+    snap = client.get_account_snapshot()
+    pos = next((p for p in snap["positions"] if p["coin"] == symbol), None)
+    if pos is None or abs(float(pos.get("size", 0))) <= 0:
+        state.set_open_trade(None)
+        return {"status": "position_closed_on_exchange", "symbol": symbol}
+
+    candles_15m = client.get_candles(symbol, "15m", lookback_bars=80)
+    if len(candles_15m) < max(30, CONFIG.trail_ema_period + 2):
+        return None
+
+    closes = [c.close for c in candles_15m]
+    highs = [c.high for c in candles_15m]
+    lows = [c.low for c in candles_15m]
+    atr_v = atr(highs, lows, closes, period=14)
+    trail_ema = ema(closes, CONFIG.trail_ema_period)
+    current_px = client.get_all_mids().get(symbol, closes[-1])
+
+    is_long = trade.get("side") == "LONG"
+    entry_px = float(trade.get("entry_px", 0))
+    initial_stop = float(trade.get("stop_loss", 0))
+    risk_per_unit = abs(entry_px - initial_stop)
+    if risk_per_unit <= 0:
+        return None
+
+    best_price = float(trade.get("best_price", entry_px))
+    if is_long:
+        best_price = max(best_price, current_px)
+        favorable_move = best_price - entry_px
+        protective_candidate = max(
+            entry_px * (1.0 + (CONFIG.breakeven_buffer_bps + 2 * CONFIG.taker_fee_bps) / 10000.0),
+            trail_ema - atr_v * CONFIG.trail_atr_mult,
+        )
+    else:
+        best_price = min(best_price, current_px)
+        favorable_move = entry_px - best_price
+        protective_candidate = min(
+            entry_px * (1.0 - (CONFIG.breakeven_buffer_bps + 2 * CONFIG.taker_fee_bps) / 10000.0),
+            trail_ema + atr_v * CONFIG.trail_atr_mult,
+        )
+
+    max_favorable_r = favorable_move / risk_per_unit
+    trade["best_price"] = best_price
+    trade["max_favorable_r"] = max(
+        float(trade.get("max_favorable_r", 0.0)),
+        max_favorable_r,
+    )
+
+    entry_time_ms = int(trade.get("entry_time_ms", 0))
+    age_bars = 0
+    if entry_time_ms > 0:
+        age_bars = int((time.time() * 1000 - entry_time_ms) / (15 * 60 * 1000))
+
+    if age_bars >= CONFIG.no_progress_bars and trade["max_favorable_r"] < CONFIG.no_progress_min_rr:
+        cancel_results = _cancel_open_trade_orders(client, trade)
+        close_result = client.close_position(symbol)
+        state.set_open_trade(None)
+        return {
+            "status": "closed_no_progress",
+            "symbol": symbol,
+            "age_bars": age_bars,
+            "max_favorable_r": trade["max_favorable_r"],
+            "cancel_results": cancel_results,
+            "exchange_response": close_result,
+        }
+
+    if trade["max_favorable_r"] >= CONFIG.trail_activation_rr:
+        live_size = abs(float(pos["size"]))
+        current_stop = float(trade.get("active_stop_loss", initial_stop))
+        improve = (
+            protective_candidate > current_stop if is_long else protective_candidate < current_stop
+        )
+        if improve:
+            cancel_results = []
+            if trade.get("sl_oid"):
+                cancel_results = client.cancel_many(symbol, [int(trade["sl_oid"])])
+            sl_resp = client.place_stop_loss(
+                coin=symbol,
+                is_long=is_long,
+                size=live_size,
+                trigger_px=protective_candidate,
+            )
+            oid = None
+            try:
+                statuses = sl_resp["response"]["data"]["statuses"]
+                for s in statuses:
+                    for key in ("resting", "filled"):
+                        if key in s and "oid" in s[key]:
+                            oid = int(s[key]["oid"])
+                            break
+                    if oid is not None:
+                        break
+            except Exception:
+                oid = None
+            trade["sl_oid"] = oid
+            trade["active_stop_loss"] = protective_candidate
+            trade["trail_armed"] = True
+            state.set_open_trade(trade)
+            return {
+                "status": "trail_stop_updated",
+                "symbol": symbol,
+                "new_stop_loss": protective_candidate,
+                "cancel_results": cancel_results,
+            }
+
+    state.set_open_trade(trade)
+    return None
+
+
+def _build_signal_vector(client: HyperliquidClient, symbol: str) -> SignalVector | dict[str, Any]:
+    if symbol not in CONFIG.universe:
+        return {"error": f"{symbol} not in HL_UNIVERSE={CONFIG.universe}"}
+    candles_15m = client.get_candles(symbol, "15m", lookback_bars=120)
+    candles_1h = client.get_candles(symbol, "1h", lookback_bars=80)
+    min_15m = max(30, CONFIG.sweep_lookback + CONFIG.sweep_confirmation_bars + 2)
+    min_1h = max(
+        CONFIG.higher_tf_ema_fast_period,
+        CONFIG.higher_tf_ema_slow_period,
+    )
+    if len(candles_15m) < min_15m:
+        return {"error": f"insufficient 15m candles for {symbol}: {len(candles_15m)}"}
+    if len(candles_1h) < min_1h:
+        return {"error": f"insufficient 1h candles for {symbol}: {len(candles_1h)}"}
+
+    funding = client.get_funding_history(symbol, lookback_hours=120)
+    fz = funding_zscore(funding, window=90)
+    mid = client.get_all_mids().get(symbol, candles_15m[-1].close)
+
+    closes_15m = [c.close for c in candles_15m]
+    highs_15m = [c.high for c in candles_15m]
+    lows_15m = [c.low for c in candles_15m]
+    opens_15m = [c.open for c in candles_15m]
+    closes_1h = [c.close for c in candles_1h]
+
+    long_score, short_score, long_age, short_age = sweep_scores(
+        highs_15m,
+        lows_15m,
+        opens_15m,
+        closes_15m,
+        sweep_lookback=CONFIG.sweep_lookback,
+        confirmation_bars=CONFIG.sweep_confirmation_bars,
+    )
+
+    ema_fast_v = ema(closes_15m, CONFIG.trigger_ema_fast_period)
+    ema_slow_v = ema(closes_15m, CONFIG.trigger_ema_slow_period)
+    ema_htf_fast = ema(closes_1h, CONFIG.higher_tf_ema_fast_period)
+    ema_htf_slow = ema(closes_1h, CONFIG.higher_tf_ema_slow_period)
+    atr_v = atr(highs_15m, lows_15m, closes_15m, period=14)
+    ratio = ema_fast_v / ema_slow_v if ema_slow_v else float("nan")
+    htf_ratio = ema_htf_fast / ema_htf_slow if ema_htf_slow else float("nan")
+    last = candles_15m[-1]
+    bullish = reversal_candle(last.open, last.close, "long")
+    bearish = reversal_candle(last.open, last.close, "short")
+
+    return SignalVector(
+        symbol=symbol,
+        current_price=mid,
+        funding_zscore=fz,
+        sweep_long_score=long_score,
+        sweep_short_score=short_score,
+        sweep_long_age_bars=long_age,
+        sweep_short_age_bars=short_age,
+        ema_fast=ema_fast_v,
+        ema_slow=ema_slow_v,
+        ema_ratio=ratio,
+        ema_htf_fast=ema_htf_fast,
+        ema_htf_slow=ema_htf_slow,
+        ema_htf_ratio=htf_ratio,
+        atr_15m=atr_v,
+        last_candle_bullish=bullish,
+        last_candle_bearish=bearish,
+    )
+
+
 # =============================================================================
 # Tool implementations
 # =============================================================================
@@ -136,7 +337,11 @@ def tool_get_account_state() -> dict[str, Any]:
     except Exception as e:
         recon = {"error": str(e)}
 
-    # Enforce max hold
+    try:
+        managed_trade = _maybe_manage_open_trade(client, state)
+    except Exception as e:
+        managed_trade = {"error": f"trade management failed: {e}"}
+
     auto_close = _maybe_enforce_max_hold(client, state)
 
     snap = client.get_account_snapshot()
@@ -149,6 +354,8 @@ def tool_get_account_state() -> dict[str, Any]:
     snap["mainnet_armed"] = CONFIG.mainnet_armed
     snap["reconciliation"] = recon
     snap["decisions_pending"] = _get_cache().peek_count()
+    if managed_trade is not None:
+        snap["trade_management"] = managed_trade
     if startup_info is not None:
         snap["startup_reconciliation"] = startup_info
     if auto_close is not None:
@@ -163,11 +370,13 @@ def tool_get_market_data(symbol: str) -> dict[str, Any]:
     client = _get_client()
     mid = client.get_all_mids().get(symbol)
     candles_15m = client.get_candles(symbol, "15m", lookback_bars=100)
+    candles_1h = client.get_candles(symbol, "1h", lookback_bars=80)
     funding = client.get_funding_history(symbol, lookback_hours=120)
     return {
         "symbol": symbol,
         "mid": mid,
         "candles_15m_count": len(candles_15m),
+        "candles_1h_count": len(candles_1h),
         "last_candle": (
             {
                 "open": candles_15m[-1].open,
@@ -179,6 +388,7 @@ def tool_get_market_data(symbol: str) -> dict[str, Any]:
             if candles_15m
             else None
         ),
+        "last_1h_close": candles_1h[-1].close if candles_1h else None,
         "funding_history_len": len(funding),
         "latest_funding": funding[-1] if funding else None,
     }
@@ -190,74 +400,26 @@ def tool_compute_signals(symbol: str) -> dict[str, Any]:
         return {"error": f"{symbol} not in HL_UNIVERSE={CONFIG.universe}"}
 
     client = _get_client()
-    candles_15m = client.get_candles(symbol, "15m", lookback_bars=100)
-    if len(candles_15m) < 30:
-        return {"error": f"insufficient candles for {symbol}: {len(candles_15m)}"}
-
-    funding = client.get_funding_history(symbol, lookback_hours=120)
-    fz = funding_zscore(funding, window=90)
-    mid = client.get_all_mids().get(symbol, candles_15m[-1].close)
-
-    closes = [c.close for c in candles_15m]
-    highs = [c.high for c in candles_15m]
-    lows = [c.low for c in candles_15m]
-    opens = [c.open for c in candles_15m]
-
-    long_score, short_score = sweep_scores(
-        highs, lows, opens, closes, sweep_lookback=CONFIG.sweep_lookback
-    )
-
-    ema_fast_v = ema(closes, 9)
-    ema_slow_v = ema(closes, 21)
-    atr_v = atr(highs, lows, closes, period=14)
-    ratio = ema_fast_v / ema_slow_v if ema_slow_v else float("nan")
-    last = candles_15m[-1]
-    bullish = reversal_candle(last.open, last.close, "long")
-    bearish = reversal_candle(last.open, last.close, "short")
-
-    sv = SignalVector(
-        symbol=symbol,
-        current_price=mid,
-        funding_zscore=fz,
-        sweep_long_score=long_score,
-        sweep_short_score=short_score,
-        ema_fast=ema_fast_v,
-        ema_slow=ema_slow_v,
-        ema_ratio=ratio,
-        atr_15m=atr_v,
-        last_candle_bullish=bullish,
-        last_candle_bearish=bearish,
-    )
+    sv = _build_signal_vector(client, symbol)
+    if isinstance(sv, dict):
+        return sv
     return sv.to_dict()
 
 
 def tool_evaluate_strategy(symbol: str) -> dict[str, Any]:
     """PATCH (severe fix #6): now issues a single-use decision_token."""
-    sig = tool_compute_signals(symbol)
-    if "error" in sig:
-        return sig
     client = _get_client()
+    sv = _build_signal_vector(client, symbol.upper())
+    if isinstance(sv, dict):
+        return sv
     snap = client.get_account_snapshot()
     equity = float(snap["equity_usd"])
-    sv = SignalVector(
-        symbol=sig["symbol"],
-        current_price=sig["current_price"],
-        funding_zscore=sig["funding_zscore"],
-        sweep_long_score=sig["sweep_long_score"],
-        sweep_short_score=sig["sweep_short_score"],
-        ema_fast=sig["ema_fast"],
-        ema_slow=sig["ema_slow"],
-        ema_ratio=sig["ema_ratio"],
-        atr_15m=sig["atr_15m"],
-        last_candle_bullish=sig["last_candle_bullish"],
-        last_candle_bearish=sig["last_candle_bearish"],
-    )
     decision = evaluate(sv, equity_usd=equity, config=CONFIG)
     token = None
     if decision.action in ("LONG", "SHORT"):
         token = _get_cache().issue(decision)
     return {
-        "signals": sig,
+        "signals": sv.to_dict(),
         "decision": decision.to_dict(),
         "decision_token": token,
         "ttl_seconds": CONFIG.decision_ttl_seconds,
@@ -362,12 +524,38 @@ def tool_place_order(decision_token: str, override_risk: bool = False) -> dict[s
     result_dict = bracket.to_dict()
 
     if bracket.entry_status == "filled":
+        actual_stop = (
+            bracket.entry_fill_avg_px - decision.sl_distance
+            if is_buy
+            else bracket.entry_fill_avg_px + decision.sl_distance
+        )
+        actual_tp1 = (
+            bracket.entry_fill_avg_px + decision.sl_distance * CONFIG.tp1_rr
+            if is_buy
+            else bracket.entry_fill_avg_px - decision.sl_distance * CONFIG.tp1_rr
+        )
+        actual_tp2 = 0.0
+        if decision.take_profit_2:
+            tp2_dist = abs(decision.take_profit_2 - decision.entry_price)
+            actual_tp2 = (
+                bracket.entry_fill_avg_px + tp2_dist
+                if is_buy
+                else bracket.entry_fill_avg_px - tp2_dist
+            )
         state.set_open_trade({
             "symbol": decision.symbol,
             "side": decision.action,
             "size": bracket.entry_fill_size,
+            "initial_size": bracket.entry_fill_size,
             "entry_px": bracket.entry_fill_avg_px,
             "entry_time_ms": int(time.time() * 1000),  # PATCH #8: stamp for max_hold
+            "stop_loss": actual_stop,
+            "active_stop_loss": actual_stop,
+            "take_profit_1": actual_tp1,
+            "take_profit_2": actual_tp2,
+            "best_price": bracket.entry_fill_avg_px,
+            "max_favorable_r": 0.0,
+            "trail_armed": False,
             "sl_oid": bracket.sl_oid,
             "tp1_oid": bracket.tp1_oid,
             "tp2_oid": bracket.tp2_oid,
@@ -416,7 +604,7 @@ TOOL_DEFS: list[Tool] = [
     Tool(
         name="hl_get_market_data",
         description=(
-            "Fetch mid price, funding history, and 15m candles for one symbol."
+            "Fetch mid price, funding history, plus 15m and 1h candles for one symbol."
         ),
         inputSchema={
             "type": "object",
@@ -427,8 +615,8 @@ TOOL_DEFS: list[Tool] = [
     Tool(
         name="hl_compute_signals",
         description=(
-            "Compute the deterministic signal vector: funding Z-score, "
-            "liquidity sweep scores, EMA 9/21 ratio, ATR 14, reversal flag."
+            "Compute the deterministic signal vector: funding filter, "
+            "recent sweep scores, 15m/1h EMA ratios, ATR 14, and reversal flags."
         ),
         inputSchema={
             "type": "object",

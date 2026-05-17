@@ -87,20 +87,53 @@ class Config:
 
     # ---- Strategy ----
     funding_z_threshold: float = field(
-        default_factory=lambda: _env_float("HL_FUNDING_Z_THRESHOLD", 2.0)
+        default_factory=lambda: _env_float("HL_FUNDING_Z_THRESHOLD", 1.1)
     )
     sweep_min_score: float = field(
-        default_factory=lambda: _env_float("HL_SWEEP_MIN_SCORE", 0.4)
+        default_factory=lambda: _env_float("HL_SWEEP_MIN_SCORE", 0.55)
     )
-    sweep_lookback: int = field(default_factory=lambda: _env_int("HL_SWEEP_LOOKBACK", 20))
+    sweep_lookback: int = field(default_factory=lambda: _env_int("HL_SWEEP_LOOKBACK", 12))
+    sweep_confirmation_bars: int = field(
+        default_factory=lambda: _env_int("HL_SWEEP_CONFIRMATION_BARS", 2)
+    )
     ema_trend_min: float = field(
-        default_factory=lambda: _env_float("HL_EMA_TREND_MIN", 0.001)
+        default_factory=lambda: _env_float("HL_EMA_TREND_MIN", 0.0005)
     )
-    sl_atr_mult: float = field(default_factory=lambda: _env_float("HL_SL_ATR_MULT", 1.2))
+    trigger_ema_fast_period: int = field(
+        default_factory=lambda: _env_int("HL_TRIGGER_EMA_FAST_PERIOD", 9)
+    )
+    trigger_ema_slow_period: int = field(
+        default_factory=lambda: _env_int("HL_TRIGGER_EMA_SLOW_PERIOD", 21)
+    )
+    higher_tf_ema_fast_period: int = field(
+        default_factory=lambda: _env_int("HL_HIGHER_TF_EMA_FAST_PERIOD", 20)
+    )
+    higher_tf_ema_slow_period: int = field(
+        default_factory=lambda: _env_int("HL_HIGHER_TF_EMA_SLOW_PERIOD", 50)
+    )
+    sl_atr_mult: float = field(default_factory=lambda: _env_float("HL_SL_ATR_MULT", 1.0))
     sl_min_frac: float = field(default_factory=lambda: _env_float("HL_SL_MIN_FRAC", 0.003))
-    tp1_rr: float = field(default_factory=lambda: _env_float("HL_TP1_RR", 1.5))
+    tp1_rr: float = field(default_factory=lambda: _env_float("HL_TP1_RR", 1.0))
+    trail_activation_rr: float = field(
+        default_factory=lambda: _env_float("HL_TRAIL_ACTIVATION_RR", 1.0)
+    )
+    trail_atr_mult: float = field(
+        default_factory=lambda: _env_float("HL_TRAIL_ATR_MULT", 1.3)
+    )
+    trail_ema_period: int = field(
+        default_factory=lambda: _env_int("HL_TRAIL_EMA_PERIOD", 9)
+    )
+    no_progress_bars: int = field(
+        default_factory=lambda: _env_int("HL_NO_PROGRESS_BARS", 4)
+    )
+    no_progress_min_rr: float = field(
+        default_factory=lambda: _env_float("HL_NO_PROGRESS_MIN_RR", 0.35)
+    )
+    breakeven_buffer_bps: float = field(
+        default_factory=lambda: _env_float("HL_BREAKEVEN_BUFFER_BPS", 5.0)
+    )
     universe: list[str] = field(
-        default_factory=lambda: _env_list("HL_UNIVERSE", ["BTC", "ETH", "SOL"])
+        default_factory=lambda: _env_list("HL_UNIVERSE", ["BTC", "ETH"])
     )
 
     # ---- Operational ----
@@ -143,6 +176,8 @@ class Config:
             errors.append(f"HL_DAILY_LOSS_LIMIT={self.daily_loss_limit} exceeds hard cap of 0.05 (5%)")
         if self.sweep_min_score < 0 or self.sweep_min_score > 1:
             errors.append("HL_SWEEP_MIN_SCORE must be in [0, 1]")
+        if self.sweep_confirmation_bars < 1 or self.sweep_confirmation_bars > 4:
+            errors.append("HL_SWEEP_CONFIRMATION_BARS must be in [1, 4]")
         if self.sl_slippage_bps <= 0 or self.sl_slippage_bps > 500:
             errors.append("HL_SL_SLIPPAGE_BPS must be in (0, 500]")
         if self.taker_fee_bps < 0 or self.taker_fee_bps > 50:
@@ -151,6 +186,12 @@ class Config:
             errors.append("HL_MIN_NOTIONAL_USD must be >= 1")
         if self.decision_ttl_seconds < 5 or self.decision_ttl_seconds > 300:
             errors.append("HL_DECISION_TTL_SECONDS must be in [5, 300]")
+        if self.higher_tf_ema_fast_period >= self.higher_tf_ema_slow_period:
+            errors.append("higher timeframe EMA fast period must be below slow period")
+        if self.trigger_ema_fast_period >= self.trigger_ema_slow_period:
+            errors.append("trigger EMA fast period must be below slow period")
+        if self.no_progress_bars < 1 or self.no_progress_bars > 16:
+            errors.append("HL_NO_PROGRESS_BARS must be in [1, 16]")
         if self.is_mainnet and not self.mainnet_armed:
             errors.append(
                 "HL_NETWORK=mainnet but HL_MAINNET_CONFIRM != 'YES_I_UNDERSTAND' "
