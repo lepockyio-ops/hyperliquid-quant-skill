@@ -7,3 +7,7 @@ Replaced the previous Hyperliquid MCP skill layout with the current Hyperliquid/
 - main skill: `software-development/freqtrade-hyperliquid`
 - supporting skills: `software-development/quant-strategy-debugging`
   and `software-development/quant-sample-window-and-data-fallbacks`
+
+## 2026-05-18 — Backup snapshot
+
+Captured the current main-branch state again after the latest Hyperliquid/FreqAI rollback work and backtest verification.
