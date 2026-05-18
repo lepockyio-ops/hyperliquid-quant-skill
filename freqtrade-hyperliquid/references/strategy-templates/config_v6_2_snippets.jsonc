@@ -1,0 +1,139 @@
+// V6.2 runtime config snippets - merge into your rendered Hyperliquid config.
+//
+// These snippets focus on the deltas vs V6.1 needed to:
+//  - reach 30-60 trades/month on 5m main timeframe
+//  - keep round-trip fee budget close to 4 bp (maker-taker) instead of 5 bp (taker-taker)
+//  - keep exchange-side stoploss-limit attached even when the bot is down
+//  - allow custom_entry_price to live deeper inside the candle without being clamped
+//
+// Merge keys are top-level in config.json. Comments are JSONC and must be
+// stripped (e.g. via the existing render script) before Freqtrade loads them.
+{
+  "max_open_trades": 4,
+  "stake_currency": "USDC",
+  "stake_amount": "unlimited",
+  "tradable_balance_ratio": 0.6,
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+
+  // 5m main timeframe; 1h + 4h pulled via informative_pairs in strategy.
+  "timeframe": "5m",
+  "process_only_new_candles": true,
+  "process_throttle_secs": 5,
+
+  // V6.2 unfilledtimeout: limit entries get one full 5m candle to fill,
+  // then are abandoned. Exits are GTC (already handled by order_time_in_force).
+  "unfilledtimeout": {
+    "entry": 5,
+    "exit": 30,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  },
+
+  // Post-only entry pricing. price_last_balance=0 means never chase.
+  // custom_price_max_distance_ratio gives custom_entry_price() room to
+  // place pullback/trend limits 0.5% away from current price.
+  "custom_price_max_distance_ratio": 0.005,
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1,
+    "price_last_balance": 0.0,
+    "check_depth_of_market": {"enabled": false}
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+
+  // order_types and order_time_in_force are also set in the strategy class,
+  // but freqtrade resolves the merged value; keep them aligned here so
+  // show-config and the rendered runtime config agree.
+  "order_types": {
+    "entry": "limit",
+    "exit": "limit",
+    "stoploss": "limit",
+    "stoploss_on_exchange": true,
+    "stoploss_on_exchange_interval": 60,
+    "stoploss_on_exchange_limit_ratio": 0.99
+  },
+  "order_time_in_force": {"entry": "PO", "exit": "GTC"},
+
+  "exchange": {
+    "name": "hyperliquid",
+    // walletAddress = MAIN wallet address (public identifier)
+    // privateKey    = API wallet private key (trade-only, no withdraw)
+    // See freqtrade-hyperliquid/references/freqtrade-hyperliquid-notes.md
+    "walletAddress": "${HL_MAIN_WALLET_ADDRESS}",
+    "privateKey":    "${HL_API_WALLET_PRIVATE_KEY}",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": [
+      "BTC/USDC:USDC",
+      "ETH/USDC:USDC"
+    ],
+    "pair_blacklist": []
+  },
+
+  "pairlists": [
+    {"method": "StaticPairList"}
+  ],
+
+  // Tightened protections vs V6.1: the StoplossGuard trade_limit is lower
+  // because V6.2's higher activity makes the 24h window denser.
+  "protections": [
+    {"method": "CooldownPeriod", "stop_duration_candles": 12},
+    {"method": "MaxDrawdown",
+     "lookback_period_candles": 576,
+     "trade_limit": 20,
+     "stop_duration_candles": 144,
+     "max_allowed_drawdown": 0.05},
+    {"method": "StoplossGuard",
+     "lookback_period_candles": 288,
+     "trade_limit": 3,
+     "stop_duration_candles": 72,
+     "only_per_pair": false},
+    {"method": "LowProfitPairs",
+     "lookback_period_candles": 4320,
+     "trade_limit": 15,
+     "stop_duration_candles": 576,
+     "required_profit": 0.003}
+  ],
+
+  // FreqAI block - keep V6.1 identifier scheme but rotate to a new
+  // identifier so cached predictions/models do not contaminate V6.2
+  // comparisons (core lesson 19).
+  "freqai": {
+    "enabled": true,
+    "identifier": "HL_v6_2",
+    "purge_old_models": 2,
+    "train_period_days": 60,
+    "backtest_period_days": 7,
+    "live_retrain_hours": 24,
+    "feature_parameters": {
+      "include_timeframes": ["5m", "1h", "4h"],
+      "include_corr_pairlist": ["BTC/USDC:USDC", "ETH/USDC:USDC"],
+      "label_period_candles": 6,
+      "include_shifted_candles": 2,
+      "DI_threshold": 0.9,
+      "weight_factor": 0.9,
+      "use_SVM_to_remove_outliers": true,
+      "indicator_periods_candles": [8, 24, 48]
+    },
+    "data_split_parameters": {"test_size": 0.25, "shuffle": false}
+  },
+
+  // Telegram/Webhook stay as in V6.1 (enable_via_credentials pattern from
+  // core lesson 5). Notification surface is unchanged.
+  "telegram": {"enabled": true},
+  "webhook": {"enabled": true},
+
+  "api_server": {
+    "enabled": true,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "username": "${FT_API_USER}",
+    "password": "${FT_API_PASS}"
+  }
+}

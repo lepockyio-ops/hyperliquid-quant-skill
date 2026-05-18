@@ -51,6 +51,11 @@ Use this skill when the task involves any of:
 25. **For short/mid-term Hyperliquid workflows, keep 'decision cadence' separate from 'management cadence' and 'alert cadence'.** Example from this stack: main entries are still 1h with 4h confirmation, internal order/position management may loop every 5s, and a discretionary Discord market scan may publish every 15m. Users will otherwise assume the 15m alert is the trading engine itself.
 26. **Treat Vibe-Trading as a research/factor supply layer unless it is explicitly wired into execution.** In this workflow it contributes funding / liquidation / onchain parquet and can veto entries via factor gates, but it does not place orders or manage positions; Freqtrade remains the executor.
 27. **A lightweight discretionary scan can coexist beside the main bot.** A cron-driven script that fetches Hyperliquid data, scores a setup, formats a fixed trader-readable message, and posts to a Discord webhook/channel is a valid 'observation line' even when the main bot keeps a different timeframe and strategy.
+28. **A near-zero-trade FreqAI variant cannot be evaluated by win rate.** When monthly trade count is far below the user-stated activity floor (e.g. 1 trade in 5 days vs target 30-60/month), the diagnosis is a funnel-shape problem, not an edge problem; quality metrics on N<10 are statistically meaningless.
+29. **AND-chains of 6-8 independent entry conditions collapse multiplicatively.** Single-threshold relaxations cannot bridge a 5-10x firing-rate gap without re-introducing previously identified toxic modes; switch the entry surface to a must-conditions + scored-vote shape instead.
+30. **Hold-duration overshoot is fixed by exit-side guards, not by tighter entries.** When average duration runs 2x the trader's target band (e.g. 10h vs 1-5h), add an unproductive-time exit (e.g. hold > 5h and profit < +0.3%) and a hard-cap exit (e.g. hold > 8h), instead of further tightening entry conditions.
+31. **Post-only limit entries are necessary at 30-60 trades/month frequency on Hyperliquid.** Round-trip taker-taker fees are ~5 bp; maker-taker drops that to ~4 bp; at 60 trades/month the difference is ~0.6% of equity per month, which dominates the +5% monthly target math.
+32. **Mode asymmetry from earlier sessions must persist across repair passes.** If V5 attribution flagged `short_direct` as the toxic mode, V6.2's scored-vote layer keeps short_* thresholds strictly above long_* (e.g. require score >= 4 of 6 for shorts vs 3 of 6 for longs); do not re-open the historically worse mode at the standard threshold just to hit the activity floor.
 
 ## Standard workflow
 
@@ -289,6 +294,7 @@ Use this mini-playbook before tweaking parameters:
 8. If a validation backtest suddenly turns from `0 trades` into all-losing trades, inspect the exported trades before blaming the model: pair distribution, long/short split, `trade_duration`, exit reasons, and leverage actually used. A strong red flag is `trade_duration == 0` for most or all trades, which usually means same-candle fill-and-stop behavior from the execution path rather than a clean multi-bar signal failure.
 
 ## References
+- See `references/v6_2-scored-vote-frequency-rebalance.md` for the must-conditions + scored-vote entry surface, hold-time guard, and post-only execution pattern used to rebalance a frozen V6.1 variant back inside the 30-60 trades/month + 1-5h hold target.
 - See `references/unlimited-leverage-validation.md` for the concrete pattern used in this stack: temporary validation subclass, runtime config clone, and post-backtest checks for actual leverage and same-candle stopout concentration.
 
 - See `references/trader-facing-workflow.md` for a concise human explanation template covering: main execution line vs 15m alert line, Vibe-Trading's current role, and how to explain cadence differences to an experienced trader who does not code.
